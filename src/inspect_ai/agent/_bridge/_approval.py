@@ -17,13 +17,16 @@ conversation never contains the rejected call. This mirrors the native path
 A call made through a scaffold's dispatcher function (`AgentBridge.dispatched_call`)
 is reviewed as the bridged tool call it stands for, so policies match the tool's own
 name and approvers see its own arguments; the decision is mapped back onto the
-dispatcher call the scaffold receives.
+dispatcher call the scaffold receives. Likewise a call to a tool the model was shown
+under another name than the scaffold declared it (`review_names`, from the Responses
+bridge's client tool discovery) is reviewed under the scaffold's name.
 """
 
+import dataclasses
 import sys
 from contextlib import AbstractContextManager, nullcontext
 from logging import getLogger
-from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn
+from typing import TYPE_CHECKING, Any, Mapping, NamedTuple, NoReturn
 
 from inspect_ai._util.format import format_function_call
 from inspect_ai._util.logger import warn_once
@@ -88,12 +91,14 @@ async def apply_bridge_tool_approval(
     bridge: AgentBridge,
     output: ModelOutput,
     history: list[ChatMessage],
+    review_names: Mapping[str, str] | None = None,
 ) -> BridgeApproval:
     """Approve the tool calls in a bridged model response.
 
     Calls are approved in order and evaluation stops at the first non-approval, so a
     human isn't asked to decide on calls that are about to be discarded anyway.
-    `terminate` doesn't return.
+    `terminate` doesn't return, and neither does a `modify` decision that changes the
+    function called: that is an error in the approver, and fails the sample.
 
     A multi-choice response whose alternate choices carry tool calls is reduced to
     the primary choice (with a warning) when approval is active, since only the
@@ -107,12 +112,19 @@ async def apply_bridge_tool_approval(
         bridge: Bridge whose `approval` policies (if any) apply for this call.
         output: Model output about to be handed to the scaffold.
         history: Conversation that produced `output`.
+        review_names: Name each call is reviewed under, keyed by the name the
+            model called, for tools the model is shown under another name than
+            the scaffold declared. Calls with other names are reviewed as called.
 
     Returns:
         The response for the scaffold, plus the messages to replay to the model when
         the response was rejected.
     """
-    from inspect_ai.approval._apply import apply_tool_approval, have_tool_approval
+    from inspect_ai.approval._apply import (
+        apply_tool_approval,
+        have_tool_approval,
+        modified_function_error,
+    )
 
     with bridge_approval_scope(bridge.approval):
         approval_active = have_tool_approval()
@@ -144,6 +156,9 @@ async def apply_bridge_tool_approval(
         for call in tool_calls:
             dispatched = bridge.dispatched_call(call)
             reviewed = dispatched.target if dispatched else call
+            review_name = (review_names or {}).get(reviewed.function)
+            if review_name is not None:
+                reviewed = dataclasses.replace(reviewed, function=review_name)
             # no viewer: bridged tools reach us as ToolInfo from the scaffold's
             # request, not as ToolDef, so there is no registered viewer to resolve.
             # apply_tool_approval falls back to its default rendering.
@@ -164,6 +179,11 @@ async def apply_bridge_tool_approval(
                 )
 
             if approval is not None and approval.modified is not None:
+                error = modified_function_error(reviewed, approval.modified)
+                if error is not None:
+                    failure = RuntimeError(error)
+                    bridge.request_fail(failure)
+                    raise failure
                 arguments = approval.modified.arguments
                 modified[call.id] = (
                     dispatched.dispatch(arguments) if dispatched else arguments
@@ -188,11 +208,10 @@ def with_modified_arguments(
     reference. Rewriting in place would make the log show the approved arguments as
     the model's original proposal, erasing the evidence that approval changed them.
     The native path avoids this the same way, by rebinding rather than mutating
-    (`model/_call_tools.py:653`).
+    (`call_tool()` in `model/_call_tools.py`).
 
-    Only the arguments are adopted. The native path swaps the whole call, but here
-    the scaffold dispatches on the function name and may have no handler for a
-    substituted one.
+    Only the arguments are adopted: a `modify` decision may not change the function
+    (`apply_bridge_tool_approval` fails the sample if it does).
     """
     result = output.model_copy(deep=True)
     for call in result.message.tool_calls or []:

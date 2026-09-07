@@ -1,9 +1,20 @@
 import inspect
 import warnings
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from logging import getLogger
-from typing import Any, Callable, Iterator, Sequence, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Collection,
+    Iterator,
+    Literal,
+    Mapping,
+    NamedTuple,
+    Sequence,
+    cast,
+)
 
 from pydantic import ValidationError
 from pydantic_core import PydanticSerializationError
@@ -24,9 +35,10 @@ from inspect_ai._util.url import data_uri_mime_type, is_data_uri
 from inspect_ai.agent._bridge._approval import (
     MAX_CONSECUTIVE_REJECTIONS,
     apply_bridge_tool_approval,
+    bridge_approval_scope,
     terminate_for_repeated_rejections,
 )
-from inspect_ai.agent._bridge._errors import BridgePolicyError
+from inspect_ai.agent._bridge._errors import BridgePolicyError, ResponseFilterError
 from inspect_ai.agent._bridge.types import AgentBridge, message_json_hash
 from inspect_ai.model._agent_message import validate_agent_message
 from inspect_ai.model._chat_message import ChatMessage, ChatMessageUser
@@ -36,6 +48,9 @@ from inspect_ai.model._generate_config import (
     active_generate_config,
 )
 from inspect_ai.model._model import (
+    BRIDGE_FILTER_SYNTHETIC,
+    BRIDGE_REQUEST_HEADERS,
+    BRIDGE_REQUESTED_MODEL,
     GenerateFilter,
     GenerateInput,
     Model,
@@ -46,6 +61,8 @@ from inspect_ai.model._model import (
     active_model,
     get_model,
     model_roles,
+    requested_model,
+    use_model_event_metadata,
     use_model_event_sink,
 )
 from inspect_ai.model._model_output import ModelOutput
@@ -59,6 +76,9 @@ from inspect_ai.tool._tools._web_search._web_search import (
     _normalize_config,
 )
 from inspect_ai.util._json import JSONSchema
+
+if TYPE_CHECKING:
+    from inspect_ai.event._event import Event
 
 # Generation-tuning fields a scaffold may set on a bridged request that describe
 # *how* the underlying model generates. These are the Inspect model's province
@@ -375,34 +395,25 @@ def in_bridge_model_generate() -> bool:
     return _bridge_model_generate.get()
 
 
-_filter_type_cache: dict[int, bool] = {}
-
-
 def _is_model_filter(fn: GenerateFilter) -> TypeIs[ModelGenerateFilter]:
     """True when *fn* accepts a ``Model`` as its first parameter (new-style).
 
-    Returns ``False`` for legacy filters whose first parameter is ``str``.
-    Caches per object id so ``inspect.signature`` is called at most once.
-    Emits a deprecation warning the first time a legacy filter is detected.
+    Returns ``False`` for legacy filters whose first parameter is ``str``, and
+    emits a deprecation warning for them. Not cached by ``id(fn)``: a freed
+    filter's id can be reused by a filter of the other style.
     """
-    key = id(fn)
-    result = _filter_type_cache.get(key)
-    if result is None:
-        sig = inspect.signature(fn)  # type: ignore[arg-type]
-        first = next(iter(sig.parameters.values()), None)
-        if first is not None and first.annotation is str:
-            result = False
-            warnings.warn(
-                "GenerateFilter with 'str' as the first parameter is "
-                "deprecated. Update your filter to accept a 'Model' "
-                "instance instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        else:
-            result = True
-        _filter_type_cache[key] = result
-    return result
+    sig = inspect.signature(fn)  # type: ignore[arg-type]
+    first = next(iter(sig.parameters.values()), None)
+    if first is not None and first.annotation is str:
+        warnings.warn(
+            "GenerateFilter with 'str' as the first parameter is "
+            "deprecated. Update your filter to accept a 'Model' "
+            "instance instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return False
+    return True
 
 
 def _operator_message_key(message: ChatMessageUser) -> str:
@@ -479,6 +490,225 @@ def _restore_operator_message_source(
         bridge._pending_operator = 0
 
 
+_filter_call_scope: ContextVar[object | None] = ContextVar(
+    "_bridge_filter_call_scope", default=None
+)
+
+
+@contextmanager
+def _observe_filter_model_events() -> Iterator[Callable[[], bool]]:
+    """Report whether the enclosed filter call emitted a `ModelEvent` of its own.
+
+    Decided from the transcript, not from anything the filter returns: a filter
+    that calls `model.generate()` has already recorded that interaction. Transcript
+    subscribers fire synchronously in the emitting task's context, so a
+    `ModelEvent` seen while this call's scope marker is current came from this
+    filter call (or a task it spawned), never from a concurrent bridged request
+    writing to the same transcript.
+    """
+    from inspect_ai.event._model import ModelEvent
+    from inspect_ai.log._transcript import transcript
+
+    scope = object()
+    emitted = False
+
+    def on_event(event: "Event") -> None:
+        nonlocal emitted
+        if isinstance(event, ModelEvent) and _filter_call_scope.get() is scope:
+            emitted = True
+
+    token = _filter_call_scope.set(scope)
+    unsubscribe = transcript()._subscribe(on_event)
+    try:
+        yield lambda: emitted
+    finally:
+        unsubscribe()
+        _filter_call_scope.reset(token)
+
+
+def _record_filter_answered_interaction(
+    bridge: AgentBridge,
+    model: Model,
+    input: list[ChatMessage],
+    tools: Sequence[ToolInfo | Tool],
+    tool_choice: ToolChoice | None,
+    config: GenerateConfig,
+    output: ModelOutput,
+) -> None:
+    """Record a ModelEvent for output a bridge filter produced without generating.
+
+    The event carries the real ``ModelOutput`` the scaffold consumes, so a
+    transcript consumer can trace the resulting assistant message back to it by
+    content. ``call`` stays ``None`` (no provider request was made) and
+    ``BRIDGE_FILTER_SYNTHETIC`` marks the event, so a consumer counting real
+    provider round-trips can exclude it.
+    """
+    tool_info = [
+        tool_to_tool_info(tool) if not isinstance(tool, ToolInfo) else tool
+        for tool in tools
+    ]
+    with (
+        use_model_event_sink(bridge.model_event_sink),
+        use_model_event_metadata({BRIDGE_FILTER_SYNTHETIC: True}),
+    ):
+        # _record_model_interaction self-completes when given output (it ends
+        # with `if output: complete(output, call)`), so no explicit complete()
+        # here -- a second call would forward the event through the sink twice.
+        _ = model._record_model_interaction(  # pyright: ignore[reportPrivateUsage]  # bridge is in-package; no public recorder exists
+            input=input,
+            tools=tool_info,
+            tool_choice=tool_choice if tool_choice is not None else "auto",
+            config=config,
+            cache=None,
+            output=output,
+            call=None,
+        )
+
+
+def _bridge_request_metadata(
+    bridge: AgentBridge, metadata_headers: dict[str, str] | None
+) -> dict[str, dict[str, str]]:
+    """Select configured non-sensitive request headers for event metadata."""
+    if not bridge.model_event_metadata_headers or metadata_headers is None:
+        return {}
+
+    selected = {
+        name: metadata_headers[name]
+        for name in bridge.model_event_metadata_headers
+        if name in metadata_headers
+    }
+    return {BRIDGE_REQUEST_HEADERS: selected} if selected else {}
+
+
+def _routing_context(
+    routing: "BridgeModelResolution | None",
+) -> AbstractContextManager[None]:
+    # a fresh context manager per attempt: a @contextmanager object is single-use
+    return requested_model(routing.requested) if routing else nullcontext()
+
+
+def withhold_client_request_settings(
+    bridge: AgentBridge, config: GenerateConfig, eval_values: dict[str, Any]
+) -> None:
+    """Remove the request fields the eval's configuration governs (in place).
+
+    These fields change billing, provider-side storage or context truncation, so
+    they are the eval author's decision, not the bridged agent's. `eval_values`
+    maps each such field of the client's API to the value the eval's
+    configuration gives it. The
+    fields are removed from `config.extra_body`, so the eval's `GenerateConfig` or
+    the provider's model args govern them. A client value that differs from the
+    eval's is logged once per field per bridge, since the client cannot otherwise
+    tell that it was ignored.
+    """
+    if config.extra_body is None:
+        return
+    for field, eval_value in eval_values.items():
+        warn_ignored_client_setting(
+            bridge,
+            field,
+            config.extra_body.pop(field, None),
+            eval_value,
+            "set it with GenerateConfig extra_body or a provider model arg",
+        )
+    if not config.extra_body:
+        config.extra_body = None
+
+
+def warn_ignored_client_setting(
+    bridge: AgentBridge | None,
+    setting: str,
+    client_value: Any,
+    eval_value: Any,
+    how_to_set: str,
+) -> None:
+    """Warn, once per setting per bridge, that the client's value was ignored.
+
+    Nothing is logged when the client sent no value or the eval's value is the
+    same, or when there is no bridge (a caller converting declarations it only
+    observes). `how_to_set` tells the eval author where the setting is
+    configured.
+    """
+    if (
+        bridge is None
+        or client_value is None
+        or client_value == eval_value
+        or setting in bridge._warned_request_settings
+    ):
+        return
+    bridge._warned_request_settings.add(setting)
+    logger.warning(
+        f"The agent bridge ignored the agent's {setting}={client_value!r}: "
+        f"the eval's configuration governs {setting} ({how_to_set})."
+    )
+
+
+def client_tool_options(tool_param: Mapping[str, Any], *keys: str) -> dict[str, Any]:
+    """The options a client set on a provider tool declaration, without `keys`."""
+    return {
+        key: value
+        for key, value in tool_param.items()
+        if key not in keys and value is not None
+    }
+
+
+ToolOptionNarrowing = Callable[[Any, Any], Any]
+"""Given the eval's value (or `None`) and the client's, the narrower value, or `None`."""
+
+
+def eval_tool_options(
+    bridge: AgentBridge | None,
+    setting: str,
+    client_options: dict[str, Any],
+    eval_options: dict[str, Any],
+    how_to_set: str,
+    defaults: Mapping[str, Any] | None = None,
+    narrowing: Mapping[str, ToolOptionNarrowing] | None = None,
+    client_settable: Collection[str] = (),
+) -> dict[str, Any]:
+    """The options to use for a provider tool the client declared.
+
+    The eval's options govern. A client option is applied only when the eval
+    leaves it unset and it is in `client_settable` (options that shape results
+    without widening what the tool may reach), or when a `narrowing` for it
+    yields a value, which it does only when the client asks for less than the
+    eval allows (fewer searches, no live web access). Every other client option
+    that differs from the eval's value, or from the provider default in
+    `defaults` when the eval sets none, is ignored and warned about once per
+    bridge (`warn_ignored_client_setting`).
+    """
+    options = dict(eval_options)
+    ignored: dict[str, Any] = {}
+    for key, value in client_options.items():
+        current = options.get(key, (defaults or {}).get(key, None))
+        if value == current:
+            continue
+        if key in client_settable and key not in eval_options:
+            options[key] = value
+            continue
+        narrow = (narrowing or {}).get(key, None)
+        narrowed = narrow(current, value) if narrow is not None else None
+        if narrowed is not None:
+            options[key] = narrowed
+        else:
+            ignored[key] = value
+    warn_ignored_client_setting(bridge, setting, ignored or None, {}, how_to_set)
+    return options
+
+
+def narrow_max_uses(current: Any, value: Any) -> Any:
+    """A client's lower cap on tool uses (Anthropic `max_uses`)."""
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        if current is None or (isinstance(current, int) and value < current):
+            return value
+    return None
+
+
+def narrow_to_false(current: Any, value: Any) -> Any:
+    """A client turning an enabled option off (OpenAI `external_web_access`)."""
+    return False if value is False and current is not False else None
+
+
 async def bridge_generate(
     bridge: AgentBridge,
     model: Model,
@@ -487,6 +717,12 @@ async def bridge_generate(
     tool_choice: ToolChoice | None,
     config: GenerateConfig,
     declared_in_input: Callable[[list[ChatMessage]], Sequence[ToolInfo]] | None = None,
+    review_names: Mapping[str, str] | None = None,
+    metadata_headers: dict[str, str] | None = None,
+    requested_model: str | None = None,
+    codex_thread_metadata: dict[str, str] | None = None,
+    *,
+    routing: "BridgeModelResolution | None" = None,
 ) -> tuple[ModelOutput, ChatMessageUser | None]:
     """Generate model output through the agent bridge.
 
@@ -497,7 +733,13 @@ async def bridge_generate(
     generated from on each attempt, after compaction and any filter rewrite, so a
     declaration the filter removed cannot authorize a host call and one it added
     can; the result takes part only in resolving execution grants and is never
-    sent to the model.
+    sent to the model. For a provider without the Responses API, the Responses
+    bridge's client tool discovery also declares discovered tools in `tools`, under
+    the names the model is shown, so a filter withdraws one by removing it from
+    `tools` and from the discovery result (the result is itself a declaration).
+
+    `review_names` maps a tool name the model was shown to the name its calls are
+    approved under (see `_approval.apply_bridge_tool_approval`).
 
     If a filter is configured, it will be called on each attempt (including retries).
     The filter can either return a ModelOutput directly or modify the generation inputs.
@@ -509,7 +751,51 @@ async def bridge_generate(
     rejected call is not edited out of the response — instead the model is told it was
     rejected and generation is retried, so the scaffold sees only the replacement (see
     `_approval.apply_bridge_tool_approval`).
+
+    `routing` is how the dialect resolved `model`. Its requested name is recorded
+    on the `ModelEvent` of the client's request (whether the filter or the default
+    generation makes it), and a redirect is warned about once per name. Compaction
+    and approval calls are not the client's request and are not labelled.
     """
+    # Stamp the client-requested model and configured request metadata onto every
+    # ModelEvent emitted below. `model` here is the RESOLVED Inspect model: alias
+    # resolution may have mapped the requested name onto a different one (e.g.
+    # codex's hardcoded `codex-auto-review` guardian slug onto the eval model),
+    # and without this the requested name never reaches the transcript -- so a
+    # reviewer turn is indistinguishable from the agent's own.
+    metadata: dict[str, Any] = _bridge_request_metadata(bridge, metadata_headers)
+    if requested_model:
+        metadata[BRIDGE_REQUESTED_MODEL] = requested_model
+    if codex_thread_metadata is not None:
+        metadata["agent_bridge"] = {"codex": codex_thread_metadata}
+    with use_model_event_metadata(metadata):
+        return await _bridge_generate(
+            bridge,
+            model,
+            input,
+            tools,
+            tool_choice,
+            config,
+            declared_in_input=declared_in_input,
+            review_names=review_names,
+            routing=routing,
+        )
+
+
+async def _bridge_generate(
+    bridge: AgentBridge,
+    model: Model,
+    input: list[ChatMessage],
+    tools: Sequence[ToolInfo | Tool],
+    tool_choice: ToolChoice | None,
+    config: GenerateConfig,
+    declared_in_input: Callable[[list[ChatMessage]], Sequence[ToolInfo]] | None = None,
+    review_names: Mapping[str, str] | None = None,
+    *,
+    routing: "BridgeModelResolution | None" = None,
+) -> tuple[ModelOutput, ChatMessageUser | None]:
+    if routing is not None and routing.redirected:
+        _warn_redirect(routing, bridge.model)
     # restore operator provenance lost to a bridged scaffold's round-trip (e.g.
     # claude_code re-emits an operator message as a plain user message). Done
     # before compaction/recording so the restored source persists in both the
@@ -539,59 +825,120 @@ async def bridge_generate(
         tool_choice = original_tool_choice
         config = original_config
 
-        # Apply filter if we have it (can either return output or alternate inputs)
-        output: ModelOutput | None = None
-        if bridge.filter:
-            # tool_to_tool_info (via ToolDef) preserves `options` — including
-            # the INTERNAL_TOOL_TYPE marker — so the filter sees the same
-            # ToolInfo the model provider would. parse_tool_info re-derives
-            # from the function signature and drops options.
-            tool_info = [
-                tool_to_tool_info(tool) if not isinstance(tool, ToolInfo) else tool
-                for tool in tools
-            ]
-            if _is_model_filter(bridge.filter):
-                result = await bridge.filter(
-                    model, input_messages, tool_info, tool_choice, config
-                )
-            else:
-                result = await bridge.filter(
-                    model.name, input_messages, tool_info, tool_choice, config
-                )
-            if isinstance(result, ModelOutput):
-                output = result
-            elif isinstance(result, GenerateInput):
-                # Update the inputs that will be used for generation
-                input_messages, tools, tool_choice, config = result
+        with _routing_context(routing):
+            # Apply filter if we have it (can either return output or alternate inputs)
+            output: ModelOutput | None = None
+            filter_recorded_event = False
+            if bridge.filter:
+                # tool_to_tool_info (via ToolDef) preserves `options` — including
+                # the INTERNAL_TOOL_TYPE marker — so the filter sees the same
+                # ToolInfo the model provider would. parse_tool_info re-derives
+                # from the function signature and drops options.
+                tool_info = [
+                    tool_to_tool_info(tool) if not isinstance(tool, ToolInfo) else tool
+                    for tool in tools
+                ]
+                # under the bridge's approval policies, as a filter may generate
+                with bridge_approval_scope(bridge.approval):
+                    with _observe_filter_model_events() as filter_emitted_event:
+                        if _is_model_filter(bridge.filter):
+                            result = await bridge.filter(
+                                model, input_messages, tool_info, tool_choice, config
+                            )
+                        else:
+                            result = await bridge.filter(
+                                model.name,
+                                input_messages,
+                                tool_info,
+                                tool_choice,
+                                config,
+                            )
+                filter_recorded_event = filter_emitted_event()
+                if isinstance(result, ModelOutput):
+                    output = result
+                elif isinstance(result, GenerateInput):
+                    # Update the inputs that will be used for generation
+                    input_messages, tools, tool_choice, config = result
 
-        # Run the generation if the filter didn't. If the bridge has a
-        # model_event_sink installed, route ModelEvent emissions through it
-        # (instead of going straight to the transcript) so the caller can
-        # control when / under which span events appear.
-        if output is None:
-            with bridge_model_generate(), use_model_event_sink(bridge.model_event_sink):
-                # with fail_on_refusal set a refusal raises rather than
-                # returning; it still gets its retries, the last one propagates
+            # Run the generation if the filter didn't. If the bridge has a
+            # model_event_sink installed, route ModelEvent emissions through it
+            # (instead of going straight to the transcript) so the caller can
+            # control when / under which span events appear.
+            if output is None:
+                # under the bridge's approval policies, so remote MCP servers are refused
+                with (
+                    bridge_model_generate(),
+                    use_model_event_sink(bridge.model_event_sink),
+                    bridge_approval_scope(bridge.approval),
+                ):
+                    # with fail_on_refusal set a refusal raises rather than
+                    # returning; it still gets its retries, the last one propagates
+                    try:
+                        output = await model.generate(
+                            input=input_messages,
+                            tool_choice=tool_choice,
+                            tools=tools,
+                            config=config,
+                        )
+                    except ModelRefusalError:
+                        if (
+                            bridge.retry_refusals is not None
+                            and refusals < bridge.retry_refusals
+                        ):
+                            refusals += 1
+                            continue
+                        raise
+            elif not filter_recorded_event:
+                # The filter answered instead of the provider, so `generate()` never
+                # ran and recorded nothing. Record the interaction anyway: the
+                # scaffold consumes this output, so a grader reading the transcript
+                # otherwise sees an assistant message that no ModelEvent accounts
+                # for -- indistinguishable from a message the agent never produced,
+                # or from a foreign injection. `call=None` plus the
+                # BRIDGE_FILTER_SYNTHETIC metadata flag distinguish it from a real
+                # provider round-trip. A filter that generated (e.g. by calling
+                # `model.generate()`) already recorded its own event, so a second one
+                # here would show the same output twice.
+                _record_filter_answered_interaction(
+                    bridge, model, input_messages, tools, tool_choice, config, output
+                )
+
+            # Update the compaction baseline with the actual input token count
+            # from the generate call (most accurate source of truth). This must
+            # happen before the response filter runs: a replacing filter changes
+            # what the scaffold sees, not what the call actually consumed, and a
+            # synthetic replacement (e.g. `ModelOutput.from_content()`) carries no
+            # usage at all, which would silently stall calibration on the
+            # count_tokens estimate for the rest of the run.
+            if compact is not None:
+                await compact.record_output(input_messages, output)
+
+            # Apply response filter if configured.
+            # Runs inside the refusal-retry loop so a filter that returns a
+            # content_filter ModelOutput triggers a retry; the input arguments
+            # passed are the same ones sent to model.generate() (post-request-filter
+            # mutation if applicable). A response_filter is eval logic, not a
+            # passive observer, so a failure in it fails the sample (attributed
+            # to the filter) instead of being reported to the scaffold as a
+            # model/provider error; see `ResponseFilterError`.
+            if bridge.response_filter is not None:
+                tool_info_for_response = [
+                    tool_to_tool_info(tool) if not isinstance(tool, ToolInfo) else tool
+                    for tool in tools
+                ]
                 try:
-                    output = await model.generate(
-                        input=input_messages,
-                        tool_choice=tool_choice,
-                        tools=tools,
-                        config=config,
+                    filtered = await bridge.response_filter(
+                        model,
+                        output,
+                        input_messages,
+                        tool_info_for_response,
+                        tool_choice,
+                        config,
                     )
-                except ModelRefusalError:
-                    if (
-                        bridge.retry_refusals is not None
-                        and refusals < bridge.retry_refusals
-                    ):
-                        refusals += 1
-                        continue
-                    raise
-
-        # Update the compaction baseline with the actual input token
-        # count from the generate call (most accurate source of truth)
-        if compact is not None:
-            await compact.record_output(input_messages, output)
+                except Exception as ex:
+                    raise ResponseFilterError(str(ex)) from ex
+                if filtered is not None:
+                    output = filtered
 
         # Check for refusal and retry if needed
         if not output.empty and output.stop_reason == "content_filter":
@@ -610,7 +957,9 @@ async def bridge_generate(
         # are the only ones the scaffold may run as host tools, once each; they
         # resolve against the declarations this attempt generated with (tools and
         # in-input declarations alike), which a filter may have rewritten.
-        reviewed = await apply_bridge_tool_approval(bridge, output, input_messages)
+        reviewed = await apply_bridge_tool_approval(
+            bridge, output, input_messages, review_names
+        )
         if reviewed.rejection is None:
             declarations: list[ToolInfo | Tool] = list(tools)
             if declared_in_input is not None:
@@ -644,55 +993,102 @@ def resolve_generate_config(
     return config
 
 
-def resolve_inspect_model(
-    model_name: str,
-    model_aliases: dict[str, str | Model] | None = None,
-    fallback_model: str | None = None,
-    *,
-    model_resolver: ModelResolver | None = None,
-    provider: str = "",
-) -> Model:
-    if model_aliases and model_name in model_aliases:
-        return get_model(model_aliases[model_name])
+BridgeModelRoute = Literal[
+    "alias", "resolver", "inspect", "model", "active", "role", "passthrough", "default"
+]
+"""How the bridge chose the model for a request ("role" and "passthrough" only
+with `allow_client_model_names`)."""
 
-    # The client's original request, before provider qualification below widens a
-    # bare name (e.g. "gpt-4o" -> "openai/gpt-4o"). Kept so the active-model match
-    # at the end can still recognize a bare name that matches the active model's
-    # short name even after qualification changes `model_name`.
-    raw_model_name = model_name
+
+class BridgeModelResolution(NamedTuple):
+    """The model a bridged request is served by, and how it was chosen."""
+
+    model: Model
+    """Model that serves the request."""
+
+    route: BridgeModelRoute
+    """Resolution step that chose `model`."""
+
+    requested: str
+    """Model name the client requested."""
+
+    redirected: bool
+    """Whether `model` is not the model the requested name denotes."""
+
+
+def resolve_bridge_model(
+    requested: str,
+    *,
+    model_aliases: dict[str, str | Model] | None,
+    model_resolver: ModelResolver | None,
+    model: str | None,
+    allow_client_model_names: bool,
+    provider: str = "",
+) -> BridgeModelResolution:
+    """Resolve the model that serves a bridged request.
+
+    In order: an alias for the requested name, the `model_resolver`'s result,
+    `"inspect"` (the active model), the pinned `model`, then the active model when
+    the name denotes it. Any other name goes to the active model (route
+    `"default"`), unless `allow_client_model_names` is set, in which case a model
+    role or the model the name implies serves it, as for the in-process bridge.
+
+    Args:
+       requested: Model name the client sent.
+       model_aliases: Exact-name aliases.
+       model_resolver: Routing policy called with the provider-qualified name.
+       model: Model pin (`None` or `"inspect"` means no pin).
+       allow_client_model_names: Let a name reach the role or model it names.
+       provider: Provider of the endpoint the request arrived on, used to qualify
+          a bare name.
+    """
+    if model_aliases and requested in model_aliases:
+        return BridgeModelResolution(
+            get_model(model_aliases[requested]), "alias", requested, False
+        )
 
     # A bare model name on a provider-specific bridge endpoint resolves to that provider (the
     # endpoint implies it); otherwise get_model rejects the unqualified name.
+    qualified = requested
     if (
         provider
-        and "/" not in model_name
-        and model_name != "inspect"
-        and model_name not in model_roles()
+        and "/" not in requested
+        and requested != "inspect"
+        and requested not in model_roles()
     ):
-        model_name = f"{provider}/{model_name}"
+        qualified = f"{provider}/{requested}"
 
-    # Dynamic routing policy: checked after explicit aliases, before the static
-    # fallback. Returning None defers to the fallback / normal resolution below.
+    # Dynamic routing policy: checked after explicit aliases, before the pin.
+    # Returning None defers to the resolution below.
     if model_resolver is not None:
-        resolved = model_resolver(model_name)
+        resolved = model_resolver(qualified)
         if resolved is not None:
-            return resolved if isinstance(resolved, Model) else get_model(resolved)
+            return BridgeModelResolution(
+                resolved if isinstance(resolved, Model) else get_model(resolved),
+                "resolver",
+                requested,
+                False,
+            )
 
-    # An explicitly configured fallback overrides whatever the client asked for; it
-    # must win over the active-model match below rather than be silently shadowed
-    # by a bare name that happens to match the active model's short name.
-    fallback_applied = False
-    if fallback_model is not None:
-        if model_name != "inspect" or not fallback_model.startswith("inspect/"):
-            model_name = fallback_model
-            fallback_applied = True
+    if requested == "inspect":
+        return BridgeModelResolution(get_model(), "inspect", requested, False)
 
-    if model_name == "inspect":
-        return get_model()
+    stripped = qualified.removeprefix("inspect/")
 
-    model_name = model_name.removeprefix("inspect/")
-    if model_name in model_roles():
-        return get_model(role=model_name)
+    # An explicitly configured pin overrides whatever the client asked for; it
+    # wins over roles and the active-model match below.
+    if model is not None and model != "inspect":
+        pinned = _resolve_pinned_model(model)
+        pinned_names = {str(pinned), ModelName(pinned).name}
+        return BridgeModelResolution(
+            pinned,
+            "model",
+            requested,
+            stripped not in pinned_names and requested not in pinned_names,
+        )
+
+    if allow_client_model_names and stripped in model_roles():
+        return BridgeModelResolution(get_model(role=stripped), "role", requested, False)
 
     # Prefer the eval's own Model instance when the client names it.
     #
@@ -707,28 +1103,102 @@ def resolve_inspect_model(
     # A bare name is also matched against the raw pre-qualification request:
     # provider qualification above widens e.g. "gpt-4o" to "openai/gpt-4o", which no
     # longer matches an active model on a different provider (e.g. "azureai/gpt-4o")
-    # even though the client meant the eval's own model. That raw-name match is
-    # skipped once an explicit fallback has applied -- the fallback override must
-    # win, not be silently shadowed by this heuristic.
-    #
-    # Deliberately placed last: aliases, an explicit "inspect", and model roles all
-    # return above, so this cannot redirect a role or alias to the eval's model.
+    # even though the client meant the eval's own model.
     active = active_model()
     if active is not None and (
-        model_name in (str(active), ModelName(active).name)
-        or (not fallback_applied and raw_model_name == ModelName(active).name)
+        stripped in (str(active), ModelName(active).name)
+        or requested == ModelName(active).name
     ):
+        return BridgeModelResolution(active, "active", requested, False)
+
+    if allow_client_model_names:
+        return BridgeModelResolution(
+            get_model(stripped), "passthrough", requested, False
+        )
+
+    # the client's name never reaches get_model(): only host-side
+    # configuration decides which model serves a request
+    return BridgeModelResolution(get_model(), "default", requested, True)
+
+
+def _resolve_pinned_model(model: str) -> Model:
+    spec = model.removeprefix("inspect/")
+    if spec in model_roles():
+        return get_model(role=spec)
+    active = active_model()
+    if active is not None and spec in (str(active), ModelName(active).name):
         return active
+    return get_model(spec)
 
-    return get_model(model_name)
+
+def resolve_inspect_model(
+    model_name: str,
+    model_aliases: dict[str, str | Model] | None = None,
+    fallback_model: str | None = None,
+    *,
+    model_resolver: ModelResolver | None = None,
+    provider: str = "",
+) -> Model:
+    """Resolve the model for a sandbox bridge request (see `resolve_bridge_model`)."""
+    return resolve_bridge_model(
+        model_name,
+        model_aliases=model_aliases,
+        model_resolver=model_resolver,
+        model=fallback_model,
+        allow_client_model_names=False,
+        provider=provider,
+    ).model
 
 
-def resolve_web_search_providers(
-    providers: WebSearchProviders | None,
-) -> WebSearchProviders:
-    if providers is None:
-        providers = internal_web_search_providers()
-    return cast(WebSearchProviders, _normalize_config(providers))
+_MAX_REDIRECT_WARNINGS = 64
+_redirect_warned: set[str] = set()
+
+
+def _warn_redirect(routing: BridgeModelResolution, pin: str | None) -> None:
+    """Warn once per process for each requested name the bridge redirected.
+
+    A set rather than `warn_once`, whose history is a list scanned per message;
+    capped because the requested names come from the client.
+    """
+    if routing.requested in _redirect_warned:
+        return
+    if len(_redirect_warned) >= _MAX_REDIRECT_WARNINGS:
+        if len(_redirect_warned) == _MAX_REDIRECT_WARNINGS:
+            _redirect_warned.add(routing.requested)
+            logger.warning(
+                f"Agent bridge redirected requests for {_MAX_REDIRECT_WARNINGS} "
+                "different model names; further redirects are not reported. "
+                "Each model event records the requested name in requested_model."
+            )
+        return
+    _redirect_warned.add(routing.requested)
+
+    name = _display_model_name(routing.requested)
+    if routing.route == "model":
+        message = (
+            f"Agent bridge routed a request for model {name} to the model "
+            f"'{routing.model}'."
+        )
+        hint = f"to route it elsewhere; it was pinned by model={pin!r}."
+    else:
+        message = (
+            f"Agent bridge routed a request for model {name} to the eval model "
+            f"'{routing.model}'."
+        )
+        hint = "to route it to a model of your choice."
+    role = routing.requested.removeprefix("inspect/")
+    if role in model_roles():
+        message += (
+            f" {name} is a model role; expose it with "
+            f"model_aliases={{{name}: get_model(role={role!r})}}."
+        )
+    else:
+        message += f" Add {name} to model_aliases {hint}"
+    logger.warning(message)
+
+
+def _display_model_name(name: str) -> str:
+    return repr(name if len(name) <= 200 else name[:200] + "...")
 
 
 def internal_web_search_providers() -> WebSearchProviders:

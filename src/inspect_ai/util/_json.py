@@ -23,60 +23,12 @@ from typing import (
 from pydantic import BaseModel, Field, create_model
 from typing_extensions import is_typeddict
 
-JSONType = Literal["string", "integer", "number", "boolean", "array", "object", "null"]
-"""Valid types within JSON schema."""
+# isort: split
+# Backward-compatible re-exports of names that moved to inspect_ai.core.
+from inspect_ai.core._json import JSONSchema as JSONSchema
+from inspect_ai.core._json import JSONType as JSONType
 
-
-class JSONSchema(BaseModel):
-    """JSON Schema for type."""
-
-    type: JSONType | list[JSONType] | None = Field(default=None)
-    """JSON type of tool parameter."""
-
-    format: str | None = Field(default=None)
-    """Format of the parameter (e.g. date-time)."""
-
-    description: str | None = Field(default=None)
-    """Parameter description."""
-
-    default: Any = Field(default=None)
-    """Default value for parameter."""
-
-    enum: list[Any] | None = Field(default=None)
-    """Valid values for enum parameters."""
-
-    items: Optional["JSONSchema"] = Field(default=None)
-    """Valid type for array parameters."""
-
-    properties: dict[str, "JSONSchema"] | None = Field(default=None)
-    """Valid fields for object parametrs."""
-
-    additionalProperties: Optional["JSONSchema"] | bool | None = Field(default=None)
-    """Are additional properties allowed?"""
-
-    anyOf: list["JSONSchema"] | None = Field(default=None)
-    """Valid types for union parameters."""
-
-    required: list[str] | None = Field(default=None)
-    """Required fields for object parameters."""
-
-    pattern: str | None = Field(default=None)
-    """Regex pattern for string parameters."""
-
-    minLength: int | None = Field(default=None)
-    """Minimum length for string parameters."""
-
-    maxLength: int | None = Field(default=None)
-    """Maximum length for string parameters."""
-
-    minimum: int | float | None = Field(default=None)
-    """Minimum value for numeric parameters."""
-
-    maximum: int | float | None = Field(default=None)
-    """Maximum value for numeric parameters."""
-
-    examples: list[Any] | None = Field(default=None)
-    """Example values for the parameter."""
+# End of backward-compatible re-exports.
 
 
 JSON_SCHEMA_EXTENDED_FIELDS = {
@@ -351,10 +303,23 @@ def resolve_schema_references(schema: dict[str, Any]) -> dict[str, Any]:
 
 
 def set_additional_properties_false(schema: JSONSchema) -> None:
-    # Set on top level
-    schema.additionalProperties = False
+    """Set `additionalProperties: false` on every object node of a schema.
 
-    # Recursively process nested schemas
+    Structured-output providers require objects to forbid extra properties but
+    reject `additionalProperties` on non-object nodes: the Anthropic API answers
+    HTTP 400 ("For 'anyOf', 'additionalProperties' is not supported") when the
+    keyword lands on the `anyOf` that Pydantic emits for an optional field, and
+    Bedrock's grammar compiler does the same. Only object nodes are stamped;
+    they include nullable objects typed `["object", "null"]`, which Bedrock
+    requires to be strict, and nodes with properties but no type.
+    """
+    if (
+        schema.type == "object"
+        or (isinstance(schema.type, list) and "object" in schema.type)
+        or schema.properties
+    ):
+        schema.additionalProperties = False
+
     if schema.items:
         set_additional_properties_false(schema.items)
 

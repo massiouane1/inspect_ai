@@ -5,8 +5,14 @@ from ._as_solver import as_solver
 from ._as_tool import as_tool
 from ._bridge.bridge import agent_bridge, bridge
 from ._bridge.sandbox.bridge import sandbox_agent_bridge
+from ._bridge.sandbox.proxy import ModelProxy, ModelProxyError, sandbox_model_proxy
 from ._bridge.sandbox.types import SandboxAgentBridge
-from ._bridge.types import AgentBridge
+from ._bridge.types import (
+    AgentBridge,
+    BridgeConversation,
+    BridgeConversationSelector,
+    StateFilter,
+)
 from ._channel import (
     AgentChannel,
     AgentInterrupted,
@@ -16,6 +22,7 @@ from ._deepagent import Subagent, deepagent, general, plan, research, subagent
 from ._filter import MessageFilter, content_only, last_message, remove_tools
 from ._handoff import handoff
 from ._human.agent import human_cli
+from ._human.commands.command import HumanAgentCommand, HumanAgentCommandsFilter
 from ._react import react
 from ._run import run
 from ._types import (
@@ -29,14 +36,22 @@ __all__ = [
     "react",
     "bridge",
     "human_cli",
+    "HumanAgentCommand",
+    "HumanAgentCommandsFilter",
     "run",
     "handoff",
     "as_tool",
     "as_solver",
     "agent_bridge",
     "sandbox_agent_bridge",
+    "sandbox_model_proxy",
+    "ModelProxy",
+    "ModelProxyError",
     "AgentBridge",
+    "BridgeConversation",
+    "BridgeConversationSelector",
     "SandboxAgentBridge",
+    "StateFilter",
     "BridgedToolsSpec",
     "content_only",
     "last_message",

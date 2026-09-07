@@ -7,7 +7,17 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from logging import getLogger
 from pathlib import PurePath
-from typing import Any, Awaitable, Callable, Literal, NamedTuple, Protocol, TypeAlias
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Literal,
+    NamedTuple,
+    Protocol,
+    Sequence,
+    TypeAlias,
+)
 
 import anyio
 from anyio.abc import TaskGroup
@@ -37,6 +47,8 @@ from inspect_ai._display import (
 )
 from inspect_ai._display.core.display import TaskCancel, TaskDisplayMetric
 from inspect_ai._eval.task.scan import Scanners
+from inspect_ai._sentinel._config import SentinelRoot
+from inspect_ai._sentinel._context import SentinelFailure
 from inspect_ai._util._async import Wake, aexit_shielded_when
 from inspect_ai._util.async_zip import AsyncZipReader
 from inspect_ai._util.asyncfiles import get_async_filesystem
@@ -193,7 +205,7 @@ from inspect_ai.util._span import span
 from inspect_ai.util._store import init_subtask_store
 
 from ..context import init_task_context
-from ..task import Task
+from ..task import SampleResource, Task
 from .enqueue import get_task_enqueuer
 from .error import SampleErrorHandler, _should_eval_fail
 from .generate import task_generate
@@ -208,6 +220,7 @@ from .images import (
 from .log import TaskLogger, collect_eval_data, plan_to_eval_plan
 from .results import eval_results
 from .sample_source import (
+    EnqueuedSample,
     SampleEnqueuer,
     SampleSource,
     clear_sample_enqueuer,
@@ -223,6 +236,7 @@ from .scan import (
 from .scheduler import (
     DISCARDED,
     Discarded,
+    SampleKey,
     SampleQueueHooks,
     SampleRequeue,
     SampleScheduler,
@@ -283,11 +297,13 @@ class SeedSource(NamedTuple):
     otherwise) or an in-memory prior log's samples (re-logged). `classify`
     resolves a seeded record read back from the attempt's own log — clean,
     errored, invalidated, or absent — the same way `EvalSampleSource.lookup`
-    resolves one read from the prior source.
+    resolves one read from the prior source. `epochs` is the prior's
+    configured epoch count.
     """
 
     source: str | list[EvalSample]
     classify: PriorClassifier
+    epochs: int
 
 
 class EvalSampleSource(NamedTuple):
@@ -628,6 +644,8 @@ class TaskRunOptions:
     logger: TaskLogger
     eval_wd: str
     config: EvalConfig = field(default_factory=EvalConfig)
+    sentinel: "SentinelRoot | None" = field(default=None)
+    """Resolved root protocol of the task's sentinel."""
     solver: Solver | None = field(default=None)
     scanner: "Scanners | None" = field(default=None)
     scan_id: str | None = field(default=None)
@@ -771,6 +789,9 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
         generate_config,
         options.task.approval,
         options.task.review,
+        options.sentinel,
+        options.task.metadata,
+        options.task.description,
     )
 
     # track stats, results, and log. progress results are keyed by
@@ -818,6 +839,8 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
         for index, sample in enumerate(dataset)
         if sample.id is not None
     }
+    # (sample id, epoch) -> fanout index for samples added with an explicit epoch
+    epoch_sample_indexes: dict[SampleKey, int] = {}
 
     async def finish_task_log(
         status: EvalStatus,
@@ -940,6 +963,7 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
     if sample_source is not None and sample_source.seed is not None and log_samples:
         await logger.seed_from_prior(
             sample_source.seed.source,
+            prior_epochs=sample_source.seed.epochs,
             # A limited feed's later selections are unknown until admission;
             # add_and_start seeds those records before dispatching them.
             keep=None
@@ -999,10 +1023,10 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
 
     # samples a SampleSource injects while the task runs, indexed after the
     # seed store (kept in memory — they arrive incrementally, not up front).
-    # a slot is released (set to None) once every epoch's latest run
-    # *completed*, so an open-ended source doesn't accumulate every sample it
-    # ever produced. An errored/cancelled epoch keeps the slot resident: the
-    # sample is requeueable, and its re-run needs the source data (which,
+    # a slot is released (set to None) once every epoch planned for it has its
+    # latest run *completed*, so an open-ended source doesn't accumulate every
+    # sample it ever produced. An errored/cancelled epoch keeps the slot
+    # resident: the sample is requeueable, and its re-run needs the source data (which,
     # unlike a seed sample's, exists nowhere else — the log record doesn't
     # carry file contents). The converse guards `get_sample`'s assert: a
     # released slot means every epoch completed, and the requeue resolver
@@ -1010,7 +1034,7 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
     # sample resident.
     store_len = len(sample_store)
     injected_samples: list[Sample | None] = []
-    injected_completed_epochs: dict[SampleIndex, set[int]] = {}
+    injected_uncompleted_epochs: dict[SampleIndex, set[int]] = {}
 
     def get_sample(sample_index: int) -> Sample:
         if sample_index < store_len:
@@ -1022,16 +1046,23 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
     def note_injected_terminal(
         sample_index: int, epoch: int, outcome: SampleTerminalOutcome
     ) -> None:
-        completed = injected_completed_epochs.setdefault(sample_index, set())
+        uncompleted = injected_uncompleted_epochs.get(sample_index)
+        if uncompleted is None:
+            return
         if outcome == "completed":
-            completed.add(epoch)
+            uncompleted.discard(epoch)
         else:
             # a requeued re-run can turn a completed epoch back into an
             # errored one only via a fresh run, which passes through here
-            completed.discard(epoch)
-        if len(completed) >= epochs:
+            uncompleted.add(epoch)
+        if not uncompleted:
+            sample = injected_samples[sample_index - store_len]
+            assert sample is not None
+            run_key = SampleKey(str(sample.id), epoch)
+            if epoch_sample_indexes.get(run_key) == sample_index:
+                del epoch_sample_indexes[run_key]
             injected_samples[sample_index - store_len] = None
-            del injected_completed_epochs[sample_index]
+            del injected_uncompleted_epochs[sample_index]
 
     # register the sample enqueuer that buffers additions to a
     # SampleSource-driven task (callback-returned samples / enqueue_sample);
@@ -1517,7 +1548,11 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
                         task_name=task.name,
                         log_location=profile.log_location,
                         create_sample_state=create_sample_state,
-                        input_media_plan=input_media_plan,
+                        # the plan authorizes seed input only: an added
+                        # sample can reuse a seed id as a further epoch
+                        input_media_plan=input_media_plan
+                        if sample_index < store_len
+                        else {},
                         sandbox=sandbox,
                         checkpoint=checkpoint,
                         eval_checkpoint=eval_checkpoint,
@@ -1529,6 +1564,7 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
                         scorer_names=scorer_names,
                         scanner=scanner,
                         cleanup=task.cleanup,
+                        sample_resources=task.sample_resources,
                         generate=generate,
                         logger=logger if log_samples else None,
                         log_images=log_images,
@@ -1613,11 +1649,14 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
                     enqueue while it blocks (no lost wakeup).
 
                     ``--limit`` caps the total samples (seed + added): once the
-                    cap is reached further additions are ignored (with a
-                    warning) and the feeder finishes without consulting the
-                    source again. ``--sample-id`` filters added samples the
-                    same way it filters the seed (the filter and the cap are
-                    mutually exclusive, matching ``slice_dataset``).
+                    cap is reached new samples are ignored (with a warning)
+                    and the feeder finishes without consulting the source
+                    again. Further epochs of admitted samples still run when
+                    enqueued from callbacks or solvers (the buffer is drained
+                    before the cap is checked). ``--sample-id`` filters added
+                    samples the same way it filters the seed (the filter and
+                    the cap are mutually exclusive, matching
+                    ``slice_dataset``).
                     """
                     nonlocal total_samples
 
@@ -1649,44 +1688,93 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
                     # by their str() form (matching ensure_unique_ids, since
                     # log member names and score grouping key on it). the seed
                     # ids come from the complete pre-slice seed set, so a
-                    # filtered-out id cannot be reclaimed by a dynamic sample
+                    # filtered-out id cannot be reclaimed by a dynamic sample.
+                    # uniqueness is on (id, epoch): a sample added without an
+                    # epoch reserves (id, 1..epochs), one with an epoch (id, epoch)
                     seen_ids = set(seed_ids)
+                    reserved_runs = {
+                        SampleKey(id, epoch)
+                        for id in seed_ids
+                        for epoch in range(1, epochs + 1)
+                    }
+                    # --limit counts distinct samples: a further epoch of an
+                    # admitted id is not counted again
+                    admitted_ids = (
+                        {str(id) for id in sample_ids}
+                        if remaining is not None
+                        else set()
+                    )
                     auto_id = store_len
 
                     class AddedSamples(NamedTuple):
-                        indexes: list[int]
                         samples: list[Sample]
+                        runs: list[SampleIndexEpoch]
+                        run_ids: list[SampleIdEpoch]
+                        all_epoch_ids: list[int | str]
+                        explicit_epoch_runs: list[SampleIdEpoch]
 
-                    def add_samples(samples: list[Sample]) -> AddedSamples:
-                        nonlocal auto_id, remaining
-                        added = AddedSamples([], [])
-                        over_limit = 0
-                        for sample in samples:
-                            if sample.id is None:
+                    def reserve_runs(sample: Sample, epoch: int | None) -> list[int]:
+                        """Assign an auto-id if needed and reserve the epochs to run."""
+                        nonlocal auto_id
+                        if sample.id is None:
+                            auto_id += 1
+                            while str(auto_id) in seen_ids:
                                 auto_id += 1
-                                while str(auto_id) in seen_ids:
-                                    auto_id += 1
-                                sample.id = auto_id
-                            if str(sample.id) in seen_ids:
-                                raise ValueError(
-                                    f"SampleSource added a sample with duplicate "
-                                    f"id '{sample.id}'. Please ensure each sample "
-                                    "has a unique id."
-                                )
-                            seen_ids.add(str(sample.id))
+                            sample.id = auto_id
+                        key = str(sample.id)
+                        planned = (
+                            list(range(1, epochs + 1)) if epoch is None else [epoch]
+                        )
+                        runs = {SampleKey(key, e) for e in planned}
+                        if not runs.isdisjoint(reserved_runs):
+                            for_epoch = "" if epoch is None else f" for epoch {epoch}"
+                            raise ValueError(
+                                f"SampleSource added a sample with duplicate "
+                                f"id '{sample.id}'{for_epoch}. Please ensure each "
+                                "sample id is added once per epoch."
+                            )
+                        reserved_runs.update(runs)
+                        seen_ids.add(key)
+                        return planned
+
+                    def within_limit(sample: Sample) -> bool:
+                        nonlocal remaining
+                        key = str(sample.id)
+                        if remaining is None or key in admitted_ids:
+                            return True
+                        if remaining <= 0:
+                            return False
+                        remaining -= 1
+                        admitted_ids.add(key)
+                        return True
+
+                    def add_samples(samples: list[EnqueuedSample]) -> AddedSamples:
+                        added = AddedSamples([], [], [], [], [])
+                        over_limit = 0
+                        for sample, epoch in samples:
+                            planned_epochs = reserve_runs(sample, epoch)
+                            assert sample.id is not None
                             if include_id is not None and not include_id(sample.id):
                                 continue
-                            if remaining is not None:
-                                if remaining <= 0:
-                                    over_limit += 1
-                                    continue
-                                remaining -= 1
-                            sample_ids.append(sample.id)
+                            if not within_limit(sample):
+                                over_limit += 1
+                                continue
                             injected_samples.append(sample)
+                            index = store_len + len(injected_samples) - 1
+                            injected_uncompleted_epochs[index] = set(planned_epochs)
                             added.samples.append(sample)
-                            added.indexes.append(store_len + len(injected_samples) - 1)
+                            added.runs.extend((index, e) for e in planned_epochs)
+                            added.run_ids.extend((sample.id, e) for e in planned_epochs)
                             # resolvable by the requeue directive, like a seed
-                            sample_indexes[str(sample.id)] = added.indexes[-1]
+                            if epoch is None:
+                                sample_ids.append(sample.id)
+                                added.all_epoch_ids.append(sample.id)
+                                sample_indexes[str(sample.id)] = index
+                            else:
+                                added.explicit_epoch_runs.append((sample.id, epoch))
+                                epoch_sample_indexes[
+                                    SampleKey(str(sample.id), epoch)
+                                ] = index
                         if over_limit:
                             py_logger.warning(
                                 f"Sample limit ({limit_count}) reached: ignoring "
@@ -1694,7 +1782,7 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
                             )
                         return added
 
-                    async def add_and_start(samples: list[Sample]) -> bool:
+                    async def add_and_start(samples: list[EnqueuedSample]) -> bool:
                         """Add samples and start them; True if any started.
 
                         Added samples get the same run-level sandbox startup
@@ -1708,48 +1796,44 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
                         nonlocal total_samples
 
                         added = add_samples(samples)
-                        added_keys = {
-                            (sample.id, epoch)
-                            for sample in added.samples
-                            if sample.id is not None
-                            for epoch in range(1, epochs + 1)
-                        }
                         if (
-                            added.samples
-                            and limited_sample_feed
-                            and logger.prior_seeded
+                            logger.prior_seeded
                             and sample_source is not None
                             and sample_source.seed is not None
                         ):
-                            await logger.seed_added_samples(
-                                sample_source.seed.source,
-                                added_keys,
+                            # prior records the upfront seed left out: a
+                            # limited feed's selection, and explicit epochs
+                            # above `epochs` up to the prior's own count
+                            prior_epochs = sample_source.seed.epochs
+                            seed_keys = (
+                                set(added.run_ids)
+                                if limited_sample_feed
+                                else {
+                                    run
+                                    for run in added.explicit_epoch_runs
+                                    if epochs < run[1] <= prior_epochs
+                                }
                             )
-                        if added.indexes:
-                            total_samples += len(added.indexes) * epochs
+                            if seed_keys:
+                                await logger.seed_added_samples(
+                                    sample_source.seed.source, seed_keys
+                                )
+                        if added.runs:
+                            total_samples += len(added.runs)
                             sample_error_handler.total_samples = total_samples
                             record_samples_added(
                                 logger.eval.eval_id,
-                                len(added.indexes) * epochs,
-                                sample_ids=[
-                                    sample.id
-                                    for sample in added.samples
-                                    if sample.id is not None
-                                ],
+                                len(added.runs),
+                                sample_ids=added.all_epoch_ids,
+                                sample_epochs=added.explicit_epoch_runs,
                             )
                             td.sample_complete(
                                 complete=len(progress_results), total=total_samples
                             )
                         if added.samples and options.startup_sandboxes is not None:
                             await options.startup_sandboxes(added.samples)
-                        scheduler.add(
-                            [
-                                (sample_index, epoch)
-                                for sample_index in added.indexes
-                                for epoch in range(1, epochs + 1)
-                            ]
-                        )
-                        return bool(added.indexes)
+                        scheduler.add(added.runs)
+                        return bool(added.runs)
 
                     async def feed_samples() -> None:
                         while True:
@@ -1782,7 +1866,9 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
                                 if not await add_and_start(enqueuer.drain()):
                                     break
                             elif more:
-                                await add_and_start(more)
+                                await add_and_start(
+                                    [EnqueuedSample(sample, None) for sample in more]
+                                )
 
                     return await scheduler.run(
                         seed_plan,
@@ -1831,6 +1917,7 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
                     scheduler=sample_scheduler,
                     sample_error=sample_error_handler,
                     sample_indexes=sample_indexes,
+                    epoch_sample_indexes=epoch_sample_indexes,
                     checkpoints_dir=eval_checkpoints_dir,
                     on_accept=on_requeue_accept,
                     on_withdraw=on_requeue_withdrawn,
@@ -2187,6 +2274,39 @@ def _sample_started() -> float | None:
     return started.timestamp() if started is not None else None
 
 
+@contextlib.asynccontextmanager
+async def _sample_resources_cm(
+    resources: "Sequence[SampleResource]", state: TaskState
+) -> AsyncIterator[None]:
+    """Hold a sample's `Task.sample_resources` open for its whole run.
+
+    Entered and exited in the sample's own task, so a resource may span setup,
+    solver and scoring without the task-affine teardown problem an
+    `AsyncExitStack` carried across tasks would have.
+
+    The cancel scope encloses the resources rather than being entered in the
+    `finally`: anyio requires scopes to exit in reverse entry order, so a scope
+    opened after the resources' own scopes (e.g. the task group inside an MCP
+    connection) makes teardown die with "Attempted to exit a cancel scope that
+    isn't the current tasks's current cancel scope". Flipping `shield` on the
+    already-innermost-compatible scope protects teardown from cancellation
+    arriving after the body without changing scope order; resources that must
+    survive an already-delivered cancellation shield their own teardown (as the
+    MCP server kill path does).
+    """
+    if not resources:
+        yield
+        return
+    with anyio.CancelScope() as scope:
+        async with contextlib.AsyncExitStack() as exit_stack:
+            for resource in resources:
+                await exit_stack.enter_async_context(resource(state))
+            try:
+                yield
+            finally:
+                scope.shield = True
+
+
 async def task_run_sample(
     *,
     task: Task,
@@ -2205,6 +2325,7 @@ async def task_run_sample(
     scorer_names: list[str] | None,
     scanner: "Scanners | None",
     cleanup: Callable[[TaskState], Awaitable[None]] | None,
+    sample_resources: "Sequence[SampleResource]",
     generate: Generate,
     logger: TaskLogger | None,
     log_images: bool,
@@ -2258,6 +2379,7 @@ async def task_run_sample(
             scorer_names=scorer_names,
             scanner=scanner,
             cleanup=cleanup,
+            sample_resources=sample_resources,
             generate=generate,
             logger=logger,
             log_images=log_images,
@@ -2309,6 +2431,7 @@ async def _task_run_sample_attempt(
     scorer_names: list[str] | None,
     scanner: "Scanners | None",
     cleanup: Callable[[TaskState], Awaitable[None]] | None,
+    sample_resources: "Sequence[SampleResource]",
     generate: Generate,
     logger: TaskLogger | None,
     log_images: bool,
@@ -2427,12 +2550,11 @@ async def _task_run_sample_attempt(
 
         # use sandbox if provided
         #
-        # The sandbox CM's `__aexit__` is wrapped so its teardown runs shielded
-        # whenever the sample's own cancel was caught upstream (`cancelled_error`
-        # set). Otherwise, the eval-level scope's still-cancelled state would
-        # re-cancel the first await inside `cleanup_sandbox_environments_sample`,
-        # propagating a fresh CancelledError out past the (already shielded)
-        # logging block and dropping the in-flight sample from the eval log.
+        # The sandbox CM's `__aexit__` is wrapped only after the sample's own
+        # cancel was caught upstream. A cancel that first arrives during
+        # cleanup can interrupt it; once scoring has finished, the outer
+        # cancellation handler below records that cancel and continues to log
+        # the in-flight sample.
         sandboxenv_cm = (
             aexit_shielded_when(
                 sandboxenv_context(
@@ -2457,6 +2579,11 @@ async def _task_run_sample_attempt(
 
         # helper to handle exceptions (will throw if we've exceeded the limit)
         def handle_error(ex: BaseException) -> tuple[EvalError, BaseException | None]:
+            # report the sentinel's own error, from the solver or scorers
+            failure = inner_exception(ex) if isinstance(ex, Exception) else ex
+            if isinstance(failure, SentinelFailure):
+                ex = inner_exception(failure.error)
+
             # helper to log sample error
             def log_sample_error() -> None:
                 msg = f"Sample error (id: {sample.id}, epoch: {state.epoch}): {exception_message(ex)})"
@@ -2540,6 +2667,7 @@ async def _task_run_sample_attempt(
             raise_error: BaseException | None = None
             cancelled_error: BaseException | None = None
             solver_cancel: BaseException | None = None
+            scoring_finished = False
             operator_cancelled = False
             results: ScoresByScorer = {}
             limit: EvalSampleLimit | None = None
@@ -2562,6 +2690,7 @@ async def _task_run_sample_attempt(
                     input=sample.input,
                     choices=sample.choices,
                     target=sample.target,
+                    description=sample.description,
                     metadata=sample.metadata or {},
                     started_at=sample_admitted_at.isoformat(),
                 )
@@ -2642,7 +2771,7 @@ async def _task_run_sample_attempt(
                         sample_summary,
                     )
 
-                async with sandboxenv_cm:
+                async with sandboxenv_cm, _sample_resources_cm(sample_resources, state):
                     try:
                         # update active sample wth sandboxes now that we are initialised
                         # (ensure that we still exit init context in presence of sandbox error)
@@ -3090,6 +3219,8 @@ async def _task_run_sample_attempt(
                             else:
                                 error, raise_error = handle_error(ex)
                         finally:
+                            scoring_finished = True
+
                             # run task cleanup if required (inside sandbox context)
                             if cleanup is not None:
                                 with anyio.CancelScope(shield=True):
@@ -3100,6 +3231,14 @@ async def _task_run_sample_attempt(
                                             f"Exception occurred during task cleanup: {ex}",
                                             exc_info=ex,
                                         )
+
+            except anyio.get_cancelled_exc_class() as ex:
+                if not scoring_finished:
+                    raise
+                with anyio.CancelScope(shield=True):
+                    cancelled_error = ex
+                    error = eval_error(ex, type(ex), ex, ex.__traceback__)
+                    transcript()._event(ErrorEvent(error=error))
 
             except Exception as ex:
                 error, raise_error = handle_error(ex)
@@ -3180,6 +3319,15 @@ async def _task_run_sample_attempt(
                                 logger.buffer_db is None
                                 or not sample_transcript.history.resident_events_truncated
                             )
+                            materialize_full_sample = (
+                                log_from_memory
+                                or _finalization_consumes_events(
+                                    scanning=scanner is not None
+                                    and scan_id is not None,
+                                    sample_feed=sample_feed,
+                                    task_source=task_source,
+                                )
+                            )
                             eval_sample = await log_sample(
                                 eval_sample=make_eval_sample(
                                     include_events=log_from_memory
@@ -3187,6 +3335,7 @@ async def _task_run_sample_attempt(
                                 logger=logger,
                                 log_images=log_images,
                                 from_memory=log_from_memory,
+                                materialize_full_sample=materialize_full_sample,
                             )
                             results = scores_as_logged(results, eval_sample)
                         else:
@@ -3382,6 +3531,7 @@ def create_eval_sample(
         input=sample.input,
         choices=sample.choices,
         target=sample.target,
+        description=sample.description,
         metadata=state.metadata or {},
         sandbox=sample.sandbox,
         files=list(sample.files.keys()) if sample.files else None,
@@ -3417,20 +3567,41 @@ def create_eval_sample(
     )
 
 
+def _finalization_consumes_events(
+    *,
+    scanning: bool,
+    sample_feed: SampleSource | None,
+    task_source: TaskSource | None,
+) -> bool:
+    """Whether a finalization consumer needs the sample's event history."""
+    from inspect_ai.hooks._hooks import any_hook_needs_full_sample
+
+    # Hook enablement must stay stable until on_sample_end dispatch.
+    return (
+        scanning
+        or sample_feed is not None
+        or task_source is not None
+        or any_hook_needs_full_sample()
+    )
+
+
 async def log_sample(
     eval_sample: EvalSample,
     logger: TaskLogger,
     log_images: bool,
     *,
     from_memory: bool,
+    materialize_full_sample: bool,
 ) -> EvalSample:
+    """Log a sample, returning the data needed by finalization consumers.
+
+    With ``from_memory=True``, ``eval_sample`` must contain the full history.
+    On buffer readback, ``materialize_full_sample=False`` returns a sample
+    without events, attachments or timelines; the written log remains complete.
+    """
     try:
-        # No realtime buffer DB, or the full history is still resident in memory:
-        # log directly from the in-memory sample (which carries its events). This
-        # avoids the open_sample_history -> materialize_streaming_sample round-trip
-        # (read every event back out of SQLite + re-validate). `complete_sample`
-        # still finalizes the buffer DB via `_finalize_sample`, so when a realtime
-        # buffer exists it stays consistent for live viewing.
+        # Avoid reading resident events back from the buffer. complete_sample
+        # still finalizes the buffer for live viewing.
         if logger.buffer_db is None or from_memory:
             await logger.complete_sample(
                 condense_sample(eval_sample, log_images), flush=True
@@ -3447,8 +3618,15 @@ async def log_sample(
         with logger.buffer_db.open_sample_history(
             eval_sample.id, eval_sample.epoch
         ) as sample_history:
-            materialized_sample = materialize_streaming_sample(
-                eval_sample, sample_history
+            # Restored attachments may exist only in eval_sample, so retain
+            # them in logging_sample. Clear timelines only in the reduced
+            # return value: their event references also retain history.
+            materialized_sample = (
+                materialize_streaming_sample(eval_sample, sample_history)
+                if materialize_full_sample
+                else eval_sample.model_copy(
+                    update={"attachments": {}, "timelines": None}
+                )
             )
             await logger.complete_sample_streaming(
                 logging_sample, sample_history, flush=True
@@ -3694,7 +3872,11 @@ def eval_log_sample_source(
 
         return EvalSampleSource(
             read_from_file,
-            SeedSource(source=eval_log_info.name, classify=classify),
+            SeedSource(
+                source=eval_log_info.name,
+                classify=classify,
+                epochs=eval_log.eval.config.epochs or 1,
+            ),
             prior_checkpoints_dir=eval_checkpoints_dir,
         )
     else:
@@ -3712,7 +3894,11 @@ def eval_log_sample_source(
 
         return EvalSampleSource(
             read_from_memory,
-            SeedSource(source=list(eval_log.samples or []), classify=classify),
+            SeedSource(
+                source=list(eval_log.samples or []),
+                classify=classify,
+                epochs=eval_log.eval.config.epochs or 1,
+            ),
             prior_checkpoints_dir=eval_checkpoints_dir,
         )
 

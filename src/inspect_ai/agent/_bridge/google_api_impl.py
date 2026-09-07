@@ -56,8 +56,8 @@ from .util import (
     client_request_object,
     client_request_string,
     relax_tool_choice_for_withheld,
+    resolve_bridge_model,
     resolve_generate_config,
-    resolve_inspect_model,
     validate_bridge_media,
     validate_client_config,
     withheld_bridge_tool,
@@ -68,19 +68,32 @@ logger = getLogger(__name__)
 
 async def inspect_google_api_request_impl(
     json_data: dict[str, Any],
+    headers: dict[str, str] | None,
     web_search_providers: WebSearchProviders | None,
     code_execution_providers: CodeExecutionProviders | None,
     bridge: AgentBridge,
+    *,
+    metadata_headers: dict[str, str] | None = None,
+    requested_model: str | None = None,
 ) -> dict[str, Any]:
     # resolve model
     bridge_model_name = str(json_data.get("model", "inspect"))
-    model = resolve_inspect_model(
+    routing = resolve_bridge_model(
         bridge_model_name,
-        bridge.model_aliases,
-        bridge.model,
+        model_aliases=bridge.model_aliases,
         model_resolver=bridge.model_resolver,
+        model=bridge.model,
+        allow_client_model_names=bridge.allow_client_model_names,
         provider="google",
     )
+    model = routing.model
+    # the name to record when the routing name is not the client's (in-process,
+    # the SDK body carries no model). Without it the routing name is recorded:
+    # through the sandbox proxy that is the URL segment truncated at the first
+    # slash (`_extract_model_from_google_path`), so an `inspect/`-prefixed name
+    # is recorded as its first segment.
+    if requested_model is not None:
+        routing = routing._replace(requested=requested_model)
 
     # extract request components
     contents: list[dict[str, Any]] = json_data.get("contents", [])
@@ -127,6 +140,7 @@ async def inspect_google_api_request_impl(
     if not bridge.forward_generation_config:
         clear_generation_params(config)
     validate_client_config(config)
+    config.extra_headers = headers
 
     # try to maintain id stability
     apply_message_ids(bridge, messages)
@@ -136,7 +150,15 @@ async def inspect_google_api_request_impl(
 
     # generate via bridge
     output, c_message = await bridge_generate(
-        bridge, model, messages, tools, tool_choice, config
+        bridge,
+        model,
+        messages,
+        tools,
+        tool_choice,
+        config,
+        requested_model=bridge_model_name,
+        metadata_headers=metadata_headers,
+        routing=routing,
     )
     if c_message is not None:
         messages.append(c_message)
@@ -144,7 +166,7 @@ async def inspect_google_api_request_impl(
     debug_log("INSPECT OUTPUT", output.message)
 
     # update state if we have more messages than the last generation
-    await bridge._track_state(messages, output)
+    await bridge._track_state(messages, output, str(ModelName(model)))
 
     # translate response to Gemini format
     response = gemini_response_from_output(output, model.api.model_name)

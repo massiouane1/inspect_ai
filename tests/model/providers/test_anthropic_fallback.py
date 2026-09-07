@@ -1,11 +1,12 @@
-"""Tests for Anthropic server-side refusal fallback (`fallback_models`).
+"""Tests for Anthropic server-side refusal fallback.
 
-Covers config plumbing, service/batch gating, response-side detection
-(ContentData wrapping, serving-model resolution, metadata, usage), the
-declined-attempt stripping rule, and replay/bridge round-tripping.
+Covers `fallback_models` and client `fallbacks` directives: config plumbing,
+service/batch gating, response-side detection (ContentData wrapping,
+serving-model resolution, metadata, usage), the declined-attempt stripping
+rule, and replay/bridge round-tripping.
 """
 
-from typing import Any, cast
+from typing import Any, Iterator, cast
 
 import pytest
 from anthropic._models import construct_type
@@ -90,22 +91,39 @@ def test_fallback_config_absent_when_unset() -> None:
     assert FALLBACK_BETA not in betas
 
 
+# Either source of a server-side fallback directive: Inspect's own
+# `fallback_models`, or a caller's verbatim `fallbacks` request field.
+FALLBACK_SOURCES = [
+    pytest.param({"fallback_models": [FALLBACK_MODEL]}, id="fallback_models"),
+    pytest.param(
+        {"extra_body": {"fallbacks": [{"model": FALLBACK_MODEL}]}},
+        id="client-directive",
+    ),
+]
+
+
+def _fallback_betas(betas: list[str]) -> list[str]:
+    return [b for b in betas if b.startswith("server-side-fallback-")]
+
+
+@pytest.mark.parametrize("source", FALLBACK_SOURCES)
 @pytest.mark.parametrize(
     "model_name",
     [
         "bedrock/us.anthropic.claude-sonnet-4-6",
         "vertex/claude-sonnet-4-6@20250929",
+        "azure/claude-sonnet-4-6",
     ],
 )
-def test_fallback_ignored_on_bedrock_vertex(
-    model_name: str, monkeypatch: pytest.MonkeyPatch
+def test_fallback_ignored_on_bedrock_vertex_azure(
+    model_name: str, source: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     setenv_if_unset("AWS_REGION", "us-east-1")
     setenv_if_unset("AWS_ACCESS_KEY_ID", "fake")
     setenv_if_unset("AWS_SECRET_ACCESS_KEY", "fake")
     setenv_if_unset("ANTHROPIC_VERTEX_PROJECT_ID", "fake")
     setenv_if_unset("ANTHROPIC_VERTEX_REGION", "us-east5")
-
+    monkeypatch.setenv("AZUREAI_ANTHROPIC_BASE_URL", "https://fake.example/anthropic")
     from inspect_ai._util import logger as logger_mod
     from inspect_ai.model._providers import anthropic as anthropic_mod
 
@@ -116,14 +134,17 @@ def test_fallback_ignored_on_bedrock_vertex(
     )
 
     api = AnthropicAPI(model_name=model_name, api_key="test-key")
-    config = GenerateConfig(max_tokens=64, fallback_models=[FALLBACK_MODEL])
+    config = GenerateConfig(max_tokens=64, **source)
     _params, extra_body, _headers, betas = api.completion_config(config)
     assert "fallbacks" not in extra_body
-    assert FALLBACK_BETA not in betas
-    assert any("fallback_models" in w for w in warnings)
+    assert _fallback_betas(betas) == []
+    assert any("bedrock/vertex/azure" in w for w in warnings)
 
 
-def test_fallback_ignored_in_batch_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("source", FALLBACK_SOURCES)
+def test_fallback_ignored_in_batch_mode(
+    source: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
     from inspect_ai._util import logger as logger_mod
     from inspect_ai.model._providers import anthropic as anthropic_mod
 
@@ -134,11 +155,79 @@ def test_fallback_ignored_in_batch_mode(monkeypatch: pytest.MonkeyPatch) -> None
     )
 
     api = AnthropicAPI(model_name=REQUESTED_MODEL, api_key="test-key")
-    config = GenerateConfig(max_tokens=64, fallback_models=[FALLBACK_MODEL], batch=True)
+    config = GenerateConfig(max_tokens=64, batch=True, **source)
+    _params, extra_body, _headers, betas = api.completion_config(config)
+    assert "fallbacks" not in extra_body
+    assert _fallback_betas(betas) == []
+    assert any("Batches" in w for w in warnings)
+
+
+@pytest.mark.parametrize(
+    "fallbacks",
+    [pytest.param([{"model": FALLBACK_MODEL}], id="explicit-list"), "default"],
+)
+def test_client_fallback_directive_sent_verbatim_under_2026_07_01(
+    fallbacks: Any,
+) -> None:
+    """Both directive forms go under `2026-07-01`, which accepts both."""
+    api = AnthropicAPI(model_name=REQUESTED_MODEL, api_key="test-key")
+    config = GenerateConfig(max_tokens=64, extra_body={"fallbacks": fallbacks})
+    _params, extra_body, _headers, betas = api.completion_config(config)
+    assert extra_body["fallbacks"] == fallbacks
+    assert _fallback_betas(betas) == ["server-side-fallback-2026-07-01"]
+
+
+def test_fallback_models_take_precedence_over_client_directive() -> None:
+    api = AnthropicAPI(model_name=REQUESTED_MODEL, api_key="test-key")
+    config = GenerateConfig(
+        max_tokens=64,
+        fallback_models=[FALLBACK_MODEL],
+        extra_body={"fallbacks": "default"},
+    )
+    _params, extra_body, _headers, betas = api.completion_config(config)
+    assert extra_body["fallbacks"] == [{"model": FALLBACK_MODEL}]
+    assert _fallback_betas(betas) == ["server-side-fallback-2026-06-01"]
+
+
+def test_client_fallback_keeps_callers_fallback_beta() -> None:
+    """A caller's `anthropic-beta` carrying `2026-07-01` is sent with it once."""
+    api = AnthropicAPI(model_name=REQUESTED_MODEL, api_key="test-key")
+    config = GenerateConfig(
+        max_tokens=64,
+        extra_body={"fallbacks": [{"model": FALLBACK_MODEL}]},
+        extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},
+    )
+    _params, extra_body, _headers, betas = api.completion_config(config)
+    assert extra_body["fallbacks"] == [{"model": FALLBACK_MODEL}]
+    sent = api._beta_header_value(betas).split(",")
+    assert _fallback_betas(sent) == ["server-side-fallback-2026-07-01"]
+
+
+def test_null_client_fallback_directive_not_sent() -> None:
+    api = AnthropicAPI(model_name=REQUESTED_MODEL, api_key="test-key")
+    config = GenerateConfig(max_tokens=64, extra_body={"fallbacks": None})
+    _params, extra_body, _headers, betas = api.completion_config(config)
+    assert "fallbacks" not in extra_body
+    assert _fallback_betas(betas) == []
+
+
+def test_fallback_ignored_on_haiku_5_5(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Haiku 5.5 rejects the `fallbacks` param, so it is not sent."""
+    from inspect_ai._util import logger as logger_mod
+    from inspect_ai.model._providers import anthropic as anthropic_mod
+
+    warnings: list[str] = []
+    logger_mod._warned.clear()
+    monkeypatch.setattr(
+        anthropic_mod.logger, "warning", lambda msg: warnings.append(msg)
+    )
+
+    api = AnthropicAPI(model_name="claude-haiku-5-5", api_key="test-key")
+    config = GenerateConfig(max_tokens=64, fallback_models=[FALLBACK_MODEL])
     _params, extra_body, _headers, betas = api.completion_config(config)
     assert "fallbacks" not in extra_body
     assert FALLBACK_BETA not in betas
-    assert any("Batches" in w for w in warnings)
+    assert any("fallback_models" in w and "claude-haiku-5-5" in w for w in warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -379,13 +468,14 @@ def test_refusal_hint_emitted(hint_warnings: list[str]) -> None:
     assert "cyber" in hint_warnings[0]
 
 
+@pytest.mark.parametrize("source", FALLBACK_SOURCES)
 def test_refusal_hint_suppressed_when_fallback_configured(
-    hint_warnings: list[str],
+    source: dict[str, Any], hint_warnings: list[str]
 ) -> None:
     api = AnthropicAPI(model_name=REQUESTED_MODEL, api_key="test-key")
     _warn_refusal_without_fallback(
         api,
-        GenerateConfig(fallback_models=[FALLBACK_MODEL]),
+        GenerateConfig(**source),
         _refusal_output(_refusal_details()),
     )
     assert hint_warnings == []
@@ -426,6 +516,15 @@ def test_refusal_hint_suppressed_on_non_claude_5(hint_warnings: list[str]) -> No
     # Opus 4.7/4.8 emit the same refusal stop_details but the fallbacks
     # param is not accepted for them
     api = AnthropicAPI(model_name=FALLBACK_MODEL, api_key="test-key")
+    _warn_refusal_without_fallback(
+        api, GenerateConfig(), _refusal_output(_refusal_details())
+    )
+    assert hint_warnings == []
+
+
+def test_refusal_hint_suppressed_on_haiku_5_5(hint_warnings: list[str]) -> None:
+    # Haiku 5.5 runs refusal classifiers but rejects the fallbacks param
+    api = AnthropicAPI(model_name="claude-haiku-5-5", api_key="test-key")
     _warn_refusal_without_fallback(
         api, GenerateConfig(), _refusal_output(_refusal_details())
     )
@@ -543,3 +642,131 @@ async def test_fallback_bridge_tolerates_from_alias() -> None:
     meta = cast(dict[str, Any], content[0].data["fallback_metadata"])
     assert meta["from"] == {"model": REQUESTED_MODEL}
     assert meta["to"] == {"model": FALLBACK_MODEL}
+
+
+# ---------------------------------------------------------------------------
+# cost: fallen-back requests are priced by the model that served them
+# ---------------------------------------------------------------------------
+
+# $ per million tokens; every token kind priced at the same rate
+REQUESTED_RATE = 25.0
+FALLBACK_RATE = 5.0
+
+
+@pytest.fixture
+def fallback_costs() -> Iterator[None]:
+    from inspect_ai.model import ModelCost, set_model_cost
+    from inspect_ai.model._model_info import clear_model_info_cache
+
+    def cost(rate: float) -> ModelCost:
+        return ModelCost(
+            input=rate, output=rate, input_cache_write=rate, input_cache_read=rate
+        )
+
+    set_model_cost(f"anthropic/{REQUESTED_MODEL}", cost(REQUESTED_RATE))
+    set_model_cost(f"anthropic/{FALLBACK_MODEL}", cost(FALLBACK_RATE))
+    yield
+    clear_model_info_cache()
+
+
+def _iteration(
+    type: str, model: str, input_tokens: int, output_tokens: int
+) -> dict[str, Any]:
+    return {
+        "type": type,
+        "model": model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
+
+
+def _recorded_cost(output: ModelOutput) -> float | None:
+    from inspect_ai.model import get_model
+    from inspect_ai.model._model import record_and_check_model_usage
+
+    model = get_model(f"anthropic/{REQUESTED_MODEL}", api_key="test-key")
+    assert output.usage is not None
+    record_and_check_model_usage(model, output.usage, output=output)
+    return output.usage.total_cost
+
+
+@pytest.mark.anyio
+async def test_fallback_priced_per_attempt(fallback_costs: None) -> None:
+    """Each billed attempt is priced at the rates of the model that ran it."""
+    init_sample_anthropic_assistant_internal()
+    message = _fallback_message(
+        [_fallback_block(), {"type": "text", "text": "served answer"}],
+        iterations=[
+            # declined mid-output: billed
+            _iteration("message", REQUESTED_MODEL, 535, 120),
+            _iteration("fallback_message", FALLBACK_MODEL, 412, 264),
+        ],
+    )
+    output, _pause = await model_output_from_message(None, REQUESTED_MODEL, message, [])
+
+    cost = _recorded_cost(output)
+    expected = (535 + 120) * REQUESTED_RATE / 1e6 + (412 + 264) * FALLBACK_RATE / 1e6
+    assert cost == pytest.approx(expected)
+
+
+@pytest.mark.anyio
+async def test_fallback_declined_before_output_not_priced(
+    fallback_costs: None,
+) -> None:
+    """An attempt that declined before any output is left out of the cost."""
+    init_sample_anthropic_assistant_internal()
+    message = _fallback_message(
+        [_fallback_block(), {"type": "text", "text": "served answer"}],
+        iterations=[
+            _iteration("message", REQUESTED_MODEL, 535, 0),
+            _iteration("fallback_message", FALLBACK_MODEL, 412, 264),
+        ],
+    )
+    output, _pause = await model_output_from_message(None, REQUESTED_MODEL, message, [])
+
+    assert _recorded_cost(output) == pytest.approx((412 + 264) * FALLBACK_RATE / 1e6)
+
+
+@pytest.mark.anyio
+async def test_fallback_without_iterations_priced_at_fallback_model(
+    fallback_costs: None,
+) -> None:
+    init_sample_anthropic_assistant_internal()
+    message = _fallback_message(
+        [_fallback_block(), {"type": "text", "text": "served answer"}]
+    )
+    output, _pause = await model_output_from_message(None, REQUESTED_MODEL, message, [])
+
+    assert _recorded_cost(output) == pytest.approx((412 + 264) * FALLBACK_RATE / 1e6)
+
+
+@pytest.mark.anyio
+async def test_sticky_routed_turn_records_fallback(fallback_costs: None) -> None:
+    """A turn sent straight to the fallback model is a fallback, priced as one."""
+    init_sample_anthropic_assistant_internal()
+    message = _fallback_message(
+        [{"type": "text", "text": "served answer"}],
+        iterations=[_iteration("fallback_message", FALLBACK_MODEL, 412, 264)],
+    )
+    output, _pause = await model_output_from_message(None, REQUESTED_MODEL, message, [])
+
+    assert output.fallback is not None
+    assert output.fallback.model == REQUESTED_MODEL
+    assert output.fallback.fallback_model == FALLBACK_MODEL
+    assert output.fallback.metadata is not None
+    assert output.fallback.metadata["handoffs"] == []
+    assert _recorded_cost(output) == pytest.approx((412 + 264) * FALLBACK_RATE / 1e6)
+
+
+@pytest.mark.anyio
+async def test_no_fallback_priced_at_requested_model(fallback_costs: None) -> None:
+    init_sample_anthropic_assistant_internal()
+    message = _fallback_message(
+        [{"type": "text", "text": "normal answer"}], model=REQUESTED_MODEL
+    )
+    output, _pause = await model_output_from_message(None, REQUESTED_MODEL, message, [])
+
+    assert output.fallback is None
+    assert _recorded_cost(output) == pytest.approx((412 + 264) * REQUESTED_RATE / 1e6)

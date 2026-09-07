@@ -2,6 +2,7 @@ import json
 from logging import getLogger
 from typing import Any, cast
 
+from openai import APIStatusError
 from openai.types.chat import (
     ChatCompletion,
     ChatCompletionMessageParam,
@@ -11,12 +12,17 @@ from typing_extensions import NotRequired, TypedDict, override
 
 from inspect_ai._util.content import ContentReasoning
 from inspect_ai._util.error import PrerequisiteError
+from inspect_ai._util.http import parse_retry_after_from_exception
 from inspect_ai._util.logger import warn_once
 from inspect_ai.model import _openrouter_reasoning
 from inspect_ai.model._chat_message import ChatMessage
 from inspect_ai.model._model import RetryDecision
 from inspect_ai.model._model_call import ModelCall
-from inspect_ai.model._model_output import ChatCompletionChoice, ModelOutput
+from inspect_ai.model._model_output import (
+    ChatCompletionChoice,
+    ModelOutput,
+    ServedModelUsage,
+)
 from inspect_ai.model._openai import (
     CompletionsReasoningContent,
     OpenAIResponseError,
@@ -163,6 +169,10 @@ class OpenRouterAPI(OpenAICompatibleAPI):
             return RetryDecision.transient()
         if isinstance(ex, json.JSONDecodeError):
             return RetryDecision.transient()
+        if _in_flight_budget_exhausted(ex):
+            return RetryDecision.rate_limit(
+                retry_after=parse_retry_after_from_exception(ex)
+            )
         return RetryDecision.no()
 
     @override
@@ -177,24 +187,18 @@ class OpenRouterAPI(OpenAICompatibleAPI):
         OpenRouter also supports suffixes like :free, :extended, :nitro,
         :thinking, :online which are stripped for database lookup.
         """
-        from ._first_party import FIRST_PARTY_PROVIDERS
+        return _openrouter_canonical_name(self.service_model_name())
 
-        name = self.service_model_name()
-
-        # Strip OpenRouter suffixes (:free, :extended, :nitro, :thinking, :online)
-        if ":" in name:
-            name = name.split(":")[0]
-
-        parts = name.split("/")
-        if len(parts) >= 2:
-            first_part = parts[0].lower()
-            # If first part is a known first-party provider, keep the full name
-            if first_part in FIRST_PARTY_PROVIDERS:
-                return name
-            # Otherwise strip the inference provider prefix (e.g., together/)
-            if len(parts) >= 3:
-                return "/".join(parts[1:])
-        return name
+    @override
+    def served_model_usage(self, output: ModelOutput) -> list[ServedModelUsage] | None:
+        # routers (e.g. openrouter/auto) and the `models` fallback list can
+        # serve a request with another model, reported in the response
+        if output.usage is None or not output.model:
+            return None
+        served = _openrouter_canonical_name(output.model)
+        if served == self.canonical_name():
+            return None
+        return [ServedModelUsage(served, output.usage)]
 
     @override
     def chat_choices_from_completion(
@@ -424,6 +428,29 @@ class OpenRouterAPI(OpenAICompatibleAPI):
         return params
 
 
+def _in_flight_budget_exhausted(ex: BaseException) -> bool:
+    """Whether `ex` is OpenRouter's 402 for a full in-flight spending budget.
+
+    OpenRouter caps the estimated cost of running and recently completed
+    requests relative to the balance, and refuses a request that doesn't fit
+    with a 402 and a `Retry-After` header, even when the balance is positive.
+    That refusal clears once in-flight costs settle, so it is retried as a
+    rate limit. OpenRouter documents `limit_source` as the field to branch on:
+    other 402s (`openrouter_credits` for an empty balance or a single request
+    larger than the whole budget, `openrouter_key_limit` for a per-key cap)
+    don't clear on retry.
+    https://openrouter.ai/docs/api-reference/limits#in-flight-spending-budget
+    """
+    if not isinstance(ex, APIStatusError) or ex.status_code != 402:
+        return False
+    body = ex.body
+    metadata = body.get("metadata") if isinstance(body, dict) else None
+    return (
+        isinstance(metadata, dict)
+        and metadata.get("limit_source") == "openrouter_in_flight_budget"
+    )
+
+
 def _requires_reasoning_content(model_name: str) -> bool:
     name = model_name.removeprefix("openrouter/").lower()
     return name.startswith("deepseek/deepseek-v4")
@@ -534,3 +561,23 @@ def _apply_cache_creation_usage(output: ModelOutput, call: ModelCall | None) -> 
         return
     output.usage.input_tokens_cache_write = cw
     output.usage.input_tokens = max(0, output.usage.input_tokens - cw)
+
+
+def _openrouter_canonical_name(name: str) -> str:
+    """Model info database name for an OpenRouter model name."""
+    from ._first_party import FIRST_PARTY_PROVIDERS
+
+    # Strip OpenRouter suffixes (:free, :extended, :nitro, :thinking, :online)
+    if ":" in name:
+        name = name.split(":")[0]
+
+    parts = name.split("/")
+    if len(parts) >= 2:
+        first_part = parts[0].lower()
+        # If first part is a known first-party provider, keep the full name
+        if first_part in FIRST_PARTY_PROVIDERS:
+            return name
+        # Otherwise strip the inference provider prefix (e.g., together/)
+        if len(parts) >= 3:
+            return "/".join(parts[1:])
+    return name

@@ -9,7 +9,7 @@ docstring-parser>=0.16
 exceptiongroup>=1.0.2; python_version < '3.11'
 fastapi>=0.119.0
 fsspec>=2023.1.0,<=2026.6.0 # align with hf datasets to prevent pip errors
-httpx
+httpx[brotli] # bridged clients advertise br in Accept-Encoding, and providers then respond br-encoded, so the decoder is required
 ijson>=3.2.0
 jsonlines>=3.0.0
 jsonpatch>=1.32
@@ -18,7 +18,7 @@ jsonref>=1.1.0
 jsonschema>3.1.1
 markdown-it-py>=2.2.0
 mmh3>3.1.0
-nest_asyncio2>=1.7.2
+nest_asyncio2>=1.7.4
 numpy
 platformdirs>=2.3.0
 psutil

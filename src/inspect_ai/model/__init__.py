@@ -60,6 +60,9 @@ from ._generate_config import (
 from ._google_convert import messages_from_google, model_output_from_google
 from ._message_ids import stable_message_ids
 from ._model import (
+    BRIDGE_FILTER_SYNTHETIC,
+    BRIDGE_REQUEST_HEADERS,
+    BRIDGE_REQUESTED_MODEL,
     GenerateFilter,
     GenerateInput,
     Model,
@@ -67,13 +70,14 @@ from ._model import (
     ModelName,
     ModelRefusalError,
     ModelResolver,
+    ModelResponseFilter,
     ModelRoles,
     RetryDecision,
     compute_model_cost,
     get_model,
     model_roles,
 )
-from ._model_call import ModelCall
+from ._model_call import ModelCall, ModelRequestId
 from ._model_config import ModelConfig
 from ._model_data.model_data import ModelCost, ModelInfo
 from ._model_info import get_model_info, set_model_cost, set_model_info
@@ -84,6 +88,7 @@ from ._model_output import (
     ModelFallback,
     ModelOutput,
     ModelUsage,
+    ServedModelUsage,
     StopCategory,
     StopDetails,
     StopReason,
@@ -112,11 +117,15 @@ from ._stream import (
 from ._trim import trim_messages
 
 __all__ = [
+    "BRIDGE_FILTER_SYNTHETIC",
+    "BRIDGE_REQUEST_HEADERS",
+    "BRIDGE_REQUESTED_MODEL",
     "BatchConfig",
     "GenerateConfig",
     "GenerateConfigArgs",
     "GenerateFilter",
     "ModelResolver",
+    "ModelResponseFilter",
     "GenerateInput",
     "ImageOutput",
     "OutputModality",
@@ -151,6 +160,7 @@ __all__ = [
     "messages_to_openai",
     "stable_message_ids",
     "ModelCall",
+    "ModelRequestId",
     "ModelCost",
     "ModelOutput",
     "ModelConversation",
@@ -173,6 +183,7 @@ __all__ = [
     "ModelRole",
     "ModelRoles",
     "RetryDecision",
+    "ServedModelUsage",
     "ModelConfig",
     "ModelFallback",
     "ModelUsage",

@@ -183,18 +183,22 @@ def _google_api(model_name: str) -> GoogleGenAIAPI:
 
 
 @pytest.mark.parametrize(
-    "effort,expected_budget",
+    "model_name,effort,expected_budget",
     [
-        ("minimal", 2048),
-        ("low", 4096),
-        ("medium", 10000),
-        ("high", 16000),
-        ("xhigh", 32000),
-        ("max", 32000),
+        ("gemini-2.5-flash", "minimal", 2048),
+        ("gemini-2.5-flash", "low", 4096),
+        ("gemini-2.5-flash", "medium", 10000),
+        ("gemini-2.5-flash", "high", 16000),
+        # capped at the model's maximum budget
+        ("gemini-2.5-flash", "xhigh", 24576),
+        ("gemini-2.5-flash", "max", 24576),
+        ("gemini-2.5-flash-lite", "max", 24576),
+        ("gemini-2.5-pro", "xhigh", 32000),
+        ("gemini-2.5-pro", "max", 32000),
     ],
 )
-def test_google_gemini_2_5_effort_bridge(effort, expected_budget):
-    api = _google_api("gemini-2.5-flash")
+def test_google_gemini_2_5_effort_bridge(model_name, effort, expected_budget):
+    api = _google_api(model_name)
     thinking_config = api.chat_thinking_config(GenerateConfig(reasoning_effort=effort))
     assert thinking_config is not None
     assert thinking_config.thinking_budget == expected_budget
@@ -630,6 +634,40 @@ def test_openai_responses_reasoning_mode_composes_with_effort():
     )
     assert params["reasoning"]["mode"] == "pro"
     assert params["reasoning"]["effort"] == "high"
+
+
+# -- OpenAI Responses client-supplied reasoning passthrough --
+
+
+def test_openai_responses_client_reasoning_forwarded_verbatim():
+    # e.g. forwarded by the agent bridge in transparent mode; `context` has no
+    # GenerateConfig representation and must survive intact
+    client_reasoning = {"context": "all_turns", "effort": "max", "summary": "auto"}
+    params = _responses_params_for(
+        "gpt-5.6-sol", GenerateConfig(extra_body={"reasoning": client_reasoning})
+    )
+    assert params["reasoning"] == client_reasoning
+
+
+def test_openai_responses_client_reasoning_no_injected_summary():
+    params = _responses_params_for(
+        "gpt-5.6-sol",
+        GenerateConfig(
+            extra_body={"reasoning": {"effort": "max", "context": "all_turns"}}
+        ),
+    )
+    assert params["reasoning"] == {"effort": "max", "context": "all_turns"}
+
+
+def test_openai_responses_client_reasoning_takes_precedence_over_modelled():
+    params = _responses_params_for(
+        "gpt-5.6-sol",
+        GenerateConfig(
+            reasoning_effort="low",
+            extra_body={"reasoning": {"effort": "max", "context": "all_turns"}},
+        ),
+    )
+    assert params["reasoning"] == {"effort": "max", "context": "all_turns"}
 
 
 def test_openai_responses_pro_mode_suppresses_sampling_params():

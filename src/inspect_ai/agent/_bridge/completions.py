@@ -9,6 +9,7 @@ from shortuuid import uuid
 from inspect_ai.agent._bridge.types import AgentBridge
 from inspect_ai.model._chat_message import ChatMessageSystem
 from inspect_ai.model._generate_config import GenerateConfig
+from inspect_ai.model._model import ModelName
 from inspect_ai.model._openai_convert import messages_from_openai
 from inspect_ai.model._providers.providers import validate_openai_client
 from inspect_ai.tool._tool_choice import ToolChoice, ToolFunction
@@ -24,8 +25,8 @@ from .util import (
     client_request_object,
     client_request_string,
     client_response_schema,
+    resolve_bridge_model,
     resolve_generate_config,
-    resolve_inspect_model,
     tool_choice_from_openai_string,
     validate_bridge_media,
     validate_client_config,
@@ -45,6 +46,8 @@ async def inspect_completions_api_request(
     json_data: dict[str, Any],
     headers: dict[str, str] | None,
     bridge: AgentBridge,
+    *,
+    metadata_headers: dict[str, str] | None = None,
 ) -> "ChatCompletion":
     validate_openai_client("agent bridge")
 
@@ -59,13 +62,15 @@ async def inspect_completions_api_request(
     )
 
     bridge_model_name = str(json_data["model"])
-    model = resolve_inspect_model(
+    routing = resolve_bridge_model(
         bridge_model_name,
-        bridge.model_aliases,
-        bridge.model,
+        model_aliases=bridge.model_aliases,
         model_resolver=bridge.model_resolver,
+        model=bridge.model,
+        allow_client_model_names=bridge.allow_client_model_names,
         provider="openai",
     )
+    model = routing.model
     model_name = model.api.model_name
 
     # convert openai messages to inspect messages
@@ -98,13 +103,21 @@ async def inspect_completions_api_request(
 
     # if there is a bridge filter give it a shot first
     output, c_message = await bridge_generate(
-        bridge, model, messages, tools, tool_choice, config
+        bridge,
+        model,
+        messages,
+        tools,
+        tool_choice,
+        config,
+        requested_model=bridge_model_name,
+        metadata_headers=metadata_headers,
+        routing=routing,
     )
     if c_message is not None:
         messages.append(c_message)
 
     # update state if we have more messages than the last generation
-    await bridge._track_state(messages, output)
+    await bridge._track_state(messages, output, str(ModelName(model)))
 
     # inspect completion to openai completion
     return ChatCompletion(

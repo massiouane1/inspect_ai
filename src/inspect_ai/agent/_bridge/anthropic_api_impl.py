@@ -19,8 +19,6 @@ from anthropic.types import (
     TextBlockParam,
     ToolReferenceBlockParam,
     Usage,
-    WebSearchTool20250305Param,
-    WebSearchTool20260209Param,
 )
 from anthropic.types import StopReason as AnthropicStopReason
 from anthropic.types.beta import (
@@ -34,6 +32,7 @@ from shortuuid import uuid
 
 from inspect_ai._util.content import Content, ContentDocument, ContentImage, ContentText
 from inspect_ai._util.images import as_data_uri
+from inspect_ai._util.logger import warn_once
 from inspect_ai.model._chat_message import (
     ChatMessage,
     ChatMessageAssistant,
@@ -46,10 +45,13 @@ from inspect_ai.model._generate_config import (
     ResponseSchema,
 )
 from inspect_ai.model._internal import CONTENT_INTERNAL_TAG, parse_content_with_internal
-from inspect_ai.model._model import ModelName
+from inspect_ai.model._model import Model, ModelName
 from inspect_ai.model._model_output import ModelUsage, StopReason
 from inspect_ai.model._providers._anthropic_citations import to_inspect_citation
 from inspect_ai.model._providers.anthropic import (
+    _WEB_SEARCH_TOOL_TYPES,
+    FALLBACKS_FIELD,
+    AnthropicAPI,
     ToolParamDef,
     anthropic_extra_body_fields,
     assistant_message_blocks,
@@ -90,12 +92,16 @@ from .util import (
     client_json_schema,
     client_request_object,
     client_request_string,
+    client_tool_options,
+    eval_tool_options,
+    narrow_max_uses,
     relax_tool_choice_for_withheld,
+    resolve_bridge_model,
     resolve_generate_config,
-    resolve_inspect_model,
     validate_bridge_media,
     validate_client_config,
     withheld_bridge_tool,
+    withhold_client_request_settings,
 )
 
 logger = getLogger(__name__)
@@ -109,16 +115,19 @@ async def inspect_anthropic_api_request_impl(
     bridge: AgentBridge,
     *,
     beta: bool = False,
+    metadata_headers: dict[str, str] | None = None,
 ) -> Message | BetaMessage:
     # resolve model
     bridge_model_name = str(json_data["model"])
-    model = resolve_inspect_model(
+    routing = resolve_bridge_model(
         bridge_model_name,
-        bridge.model_aliases,
-        bridge.model,
+        model_aliases=bridge.model_aliases,
         model_resolver=bridge.model_resolver,
+        model=bridge.model,
+        allow_client_model_names=bridge.allow_client_model_names,
         provider="anthropic",
     )
+    model = routing.model
 
     # tools
     anthropic_tools: list[ToolParamDef] | None = json_data.get("tools", None)
@@ -139,6 +148,7 @@ async def inspect_anthropic_api_request_impl(
         web_search,
         code_execution,
         bridge.allow_remote_mcp,
+        bridge=bridge,
     )
 
     # tool choice
@@ -157,8 +167,10 @@ async def inspect_anthropic_api_request_impl(
 
     # extract generate config (hoist instructions into system messages)
     config = generate_config_from_anthropic(json_data)
+    forward_client_fallbacks(config, json_data, model)
     if not bridge.forward_generation_config:
         clear_generation_params(config)
+    withhold_client_request_settings(bridge, config, _eval_request_settings(model))
     validate_client_config(config)
     config.extra_headers = headers
     # Hoist the request's `system` value into leading system messages, ONE PER
@@ -183,7 +195,15 @@ async def inspect_anthropic_api_request_impl(
 
     # if there is a bridge filter give it a shot first
     output, c_message = await bridge_generate(
-        bridge, model, messages, tools, tool_choice, config
+        bridge,
+        model,
+        messages,
+        tools,
+        tool_choice,
+        config,
+        requested_model=bridge_model_name,
+        metadata_headers=metadata_headers,
+        routing=routing,
     )
     if c_message is not None:
         messages.append(c_message)
@@ -191,7 +211,7 @@ async def inspect_anthropic_api_request_impl(
     debug_log("INSPECT OUTPUT", output.message)
 
     # update state if we have more messages than the last generation
-    await bridge._track_state(messages, output)
+    await bridge._track_state(messages, output, str(ModelName(model)))
 
     # return message (use beta message type if request came from beta endpoint)
     message_class = BetaMessage if beta else Message
@@ -242,6 +262,36 @@ def anthropic_system_to_texts(value: Any) -> list[str]:
         if text:
             texts.append(text)
     return texts
+
+
+def forward_client_fallbacks(
+    config: GenerateConfig, json_data: dict[str, Any], model: Model
+) -> None:
+    """Forward the client's `fallbacks` directive verbatim when `model` accepts it.
+
+    `fallbacks` is an Anthropic request field, so it goes only to Anthropic
+    models; other providers would send it on as an unknown field. It is sent
+    verbatim rather than via the lossy `fallback_models`. An explicit list names
+    targets the client chose for the model it asked for, and a different served
+    model may not permit some of them, which fails the request, so the list goes
+    only to the model it names. `"default"` routing is valid on any Anthropic
+    model.
+    """
+    fallbacks = json_data.get(FALLBACKS_FIELD)
+    if fallbacks is None or ModelName(model).api != "anthropic":
+        return
+    requested_model = str(json_data["model"])
+    named_model = requested_model.removeprefix("inspect/").removeprefix("anthropic/")
+    if fallbacks != "default" and model.name != named_model:
+        warn_once(
+            logger,
+            f"The bridged agent sent a `fallbacks` list for '{requested_model}', "
+            f"but '{ModelName(model)}' is serving the request; the list has been "
+            "withheld because its targets were chosen for the requested model "
+            "and may not be permitted for the served one.",
+        )
+        return
+    config.extra_body = (config.extra_body or {}) | {FALLBACKS_FIELD: fallbacks}
 
 
 def generate_config_from_anthropic(json_data: dict[str, Any]) -> GenerateConfig:
@@ -329,13 +379,39 @@ def generate_config_from_anthropic(json_data: dict[str, Any]) -> GenerateConfig:
     return config
 
 
+def _eval_request_settings(model: Model) -> dict[str, Any]:
+    """The values the eval's configuration gives the Anthropic fields the bridge withholds.
+
+    The Anthropic provider's `extra_body` model arg is merged over the request
+    last, so its `service_tier` wins over `GenerateConfig.extra_body`. When
+    neither sets it, the API default (`auto`) applies.
+    """
+    extra_body = resolve_generate_config(model, GenerateConfig()).extra_body or {}
+    if isinstance(model.api, AnthropicAPI):
+        extra_body = extra_body | (model.api.extra_body or {})
+    return {"service_tier": extra_body.get("service_tier", "auto")}
+
+
 def tools_from_anthropic_tools(
     anthropic_tools: list[ToolParamDef] | None,
     anthropic_mcp_servers: list[BetaRequestMCPServerURLDefinitionParam] | None,
     web_search_providers: WebSearchProviders | None,
     code_execution_providers: CodeExecutionProviders | None,
     allow_remote_mcp: bool,
+    *,
+    bridge: AgentBridge | None = None,
 ) -> list[ToolInfo | Tool]:
+    """Convert Anthropic tool declarations and MCP servers into inspect tools.
+
+    The eval's `web_search` configuration governs the options of a declared web
+    search tool. The client may set a `user_location` the eval leaves unset (it
+    shapes results without widening what can be searched) and may lower
+    `max_uses`. It may also choose the tool version (`type`) when the eval sets
+    none; a version the provider does not support is dropped, leaving the
+    choice to the provider. Other differing options are ignored, with a warning
+    once per `bridge`. Without a bridge (a caller that only observes the
+    declarations) the same options are used and nothing is logged.
+    """
     tools: list[ToolInfo | Tool] = []
 
     for anthropic_tool in anthropic_tools or []:
@@ -357,13 +433,31 @@ def tools_from_anthropic_tools(
             if web_search_providers is None:
                 withheld_bridge_tool("web_search")
             else:
-                tools.append(
-                    web_search(
-                        resolve_web_search_providers(
-                            anthropic_tool, web_search_providers
-                        )
-                    )
+                anthropic_options = web_search_providers.get("anthropic", None)
+                eval_options = (
+                    anthropic_options if isinstance(anthropic_options, dict) else {}
                 )
+                client_options = client_tool_options(anthropic_tool, "name")
+                if client_options.get("type") not in _WEB_SEARCH_TOOL_TYPES:
+                    client_options.pop("type", None)
+                options = eval_tool_options(
+                    bridge,
+                    "web_search options",
+                    client_options,
+                    eval_options,
+                    "set them with the bridge's web_search option",
+                    narrowing={"max_uses": narrow_max_uses},
+                    client_settable=("type", "user_location"),
+                )
+                providers = web_search_providers
+                enabled = anthropic_options is True or isinstance(
+                    anthropic_options, dict
+                )
+                if enabled and options != eval_options:
+                    providers = cast(
+                        WebSearchProviders, {**providers, "anthropic": options}
+                    )
+                tools.append(web_search(providers))
         elif is_web_fetch_tool(anthropic_tool):
             # Inspect has no standalone fetch tool: on Anthropic, fetch rides
             # along with a granted web_search (the provider emits both), so a
@@ -431,28 +525,6 @@ def tools_from_anthropic_tools(
         )
 
     return tools
-
-
-def resolve_web_search_providers(
-    tool_param: WebSearchTool20250305Param | WebSearchTool20260209Param,
-    web_search: WebSearchProviders,
-) -> WebSearchProviders:
-    # pass through anthropic options if there is no special anthropic config
-    anthropic_options = web_search.get("anthropic", False)
-    if anthropic_options is True or (
-        isinstance(anthropic_options, dict) and len(anthropic_options) == 0
-    ):
-        # this came from the user in the external scaffold. we want
-        # all the fields except the type as our 'web_search' config
-        tool_param = tool_param.copy()
-        del tool_param["type"]  # type: ignore[misc]
-
-        # this came from the inspect agent_bridge() call. we want
-        # to replace it with whatever the user specified in the scaffold.
-        web_search = web_search.copy()
-        web_search["anthropic"] = tool_param  # type: ignore[typeddict-item]
-
-    return web_search
 
 
 def tool_choice_from_anthropic_tool_choice(
