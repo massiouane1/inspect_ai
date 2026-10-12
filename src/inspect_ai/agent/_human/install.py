@@ -69,7 +69,7 @@ def human_agent_commands(commands: list[HumanAgentCommand]) -> str:
     def format_time(t):
         minutes, seconds = divmod(t, 60)
         hours, minutes = divmod(minutes, 60)
-        return f"{hours:.0f}:{minutes:02.0f}:{seconds:02.0f}"
+        return "{:.0f}:{:02.0f}:{:02.0f}".format(hours, minutes, seconds)
     """)
 
     # command handler source code (extracted from call methods)
